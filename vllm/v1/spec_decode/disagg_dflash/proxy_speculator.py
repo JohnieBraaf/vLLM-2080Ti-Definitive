@@ -4,14 +4,15 @@
 Runs on the main workers (GPU 0,2). Implements the BaseSpeculator interface so
 the rest of the model runner is unaware that the draft model is on a different
 GPU.
+
+Only TP rank 0 communicates with the draft server via ZMQ.  After getting draft
+tokens, rank 0 broadcasts them to other TP ranks via NCCL so every worker
+returns the same result (required for CUDA-graph correctness).
 """
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-import time
 from typing import Any
 
 import torch
@@ -61,7 +62,8 @@ class DisaggDFlashProposer(BaseSpeculator):
         self.max_num_tokens = max_tokens
         self.dtype = vllm_config.model_config.dtype
 
-        # Draft-token output buffer (returned to the model runner each step)
+        # Draft-token output buffer (returned to the model runner each step).
+        # Must be on device so NCCL broadcast works.
         self.draft_tokens = torch.zeros(
             max_reqs,
             self.num_speculative_steps,
@@ -70,36 +72,45 @@ class DisaggDFlashProposer(BaseSpeculator):
         )
 
         # Attributes expected by the model runner (DraftModelSpeculator contract).
-        # We don't load a draft model on the main workers, so set sensible stubs.
-        self.supports_mm_inputs = False
-        self.uses_mrope = False
+        self.supports_mm_inputs     = False
+        self.uses_mrope             = False
         self.needs_extra_input_slots = False
-        self.parallel_drafting = True
-        self.draft_is_prefilling = torch.zeros(max_reqs, dtype=torch.bool)
-        self.idx_mapping = torch.zeros(max_reqs, dtype=torch.int32, device=device)
-        self.hidden_size = spec.draft_model_config.get_hidden_size()
-        self.vocab_size = spec.draft_model_config.get_vocab_size()
-        self.max_model_len = vllm_config.model_config.max_model_len
+        self.parallel_drafting      = True
+        self.draft_is_prefilling    = torch.zeros(max_reqs, dtype=torch.bool)
+        self.idx_mapping            = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self.hidden_size            = spec.draft_model_config.get_hidden_size()
+        self.vocab_size             = spec.draft_model_config.get_vocab_size()
+        self.max_model_len          = vllm_config.model_config.max_model_len
 
-        # Sequence tracking: seq_id → seen (for detecting prefill vs decode)
+        # Sequence tracking (rank 0 only).
         self._active_seqs: set[str] = set()
 
-        # ZMQ DEALER socket (one per process; the server is a ROUTER)
-        self._zmq_ctx  = zmq.Context()
-        self._sock     = self._zmq_ctx.socket(zmq.DEALER)
-        self._sock.setsockopt(zmq.RCVTIMEO, _TIMEOUT_MS)
-        self._sock.setsockopt(zmq.SNDTIMEO, _TIMEOUT_MS)
-        self._sock.connect(self.address)
-        logger.info("DisaggDFlashProposer connected to draft server at %s", self.address)
+        # ── ZMQ: only TP rank 0 communicates with the draft server ─────────
+        try:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+            self._tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            self._tp_rank = 0
 
-        self._ping_server()
+        if self._tp_rank == 0:
+            self._zmq_ctx = zmq.Context()
+            self._sock    = self._zmq_ctx.socket(zmq.DEALER)
+            self._sock.setsockopt(zmq.RCVTIMEO, _TIMEOUT_MS)
+            self._sock.setsockopt(zmq.SNDTIMEO, _TIMEOUT_MS)
+            self._sock.connect(self.address)
+            logger.info(
+                "DisaggDFlashProposer connected to draft server at %s", self.address
+            )
+            self._ping_server()
+        else:
+            self._zmq_ctx = None
+            self._sock    = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # BaseSpeculator interface
     # ──────────────────────────────────────────────────────────────────────────
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # No CUDA graphs on the proxy side; the draft runs eagerly on GPU1
         pass
 
     def capture(self) -> None:
@@ -124,58 +135,92 @@ class DisaggDFlashProposer(BaseSpeculator):
         mm_inputs=None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        # Skip ZMQ during warmup / profiling passes.
         if dummy_run or is_profile:
             return self.draft_tokens[: input_batch.num_reqs]
 
         num_reqs = input_batch.num_reqs
-        req_ids  = list(input_batch.req_ids[:num_reqs])
+        tp_size  = self.vllm_config.parallel_config.tensor_parallel_size
 
-        # ── detect finished sequences and send FREE ──────────────────────────
-        current = set(req_ids)
+        # Only rank 0 contacts the draft server.
+        if self._tp_rank == 0:
+            self._do_propose(input_batch, last_hidden_states, num_reqs,
+                             temperature, seeds)
+
+        # Broadcast the result from rank 0 to all other TP ranks.
+        if tp_size > 1:
+            import torch.distributed as dist
+            from vllm.distributed.parallel_state import get_tp_group
+            dist.broadcast(
+                self.draft_tokens,
+                src=0,
+                group=get_tp_group().device_group,
+            )
+
+        return self.draft_tokens[:num_reqs]
+
+    def _do_propose(
+        self,
+        input_batch,
+        last_hidden_states: torch.Tensor,
+        num_reqs: int,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> None:
+        """Rank-0 only: contact the draft server and update self.draft_tokens."""
+        req_ids = [input_batch.req_ids[i] for i in range(num_reqs)]
+
+        # ── detect finished sequences, send FREE ─────────────────────────────
+        current  = set(req_ids)
         finished = self._active_seqs - current
         for seq_id in finished:
             self._send_free(seq_id)
         self._active_seqs = current
 
-        # ── detect new (prefill) sequences, send PREFILL ─────────────────────
-        # query_start_loc[i] .. query_start_loc[i+1] is the token range for req i
+        # ── detect new (prefill) sequences, send PREFILL ──────────────────────
         _qsl = getattr(input_batch, "query_start_loc_np", None)
         if _qsl is None:
             _qsl = getattr(input_batch, "query_start_loc", None)
         qsl = _qsl
+
         for i, seq_id in enumerate(req_ids):
             if seq_id not in self._active_seqs or seq_id in finished:
-                # First time seeing this sequence — it's a prefill
                 tok_start = int(qsl[i])
                 tok_end   = int(qsl[i + 1])
-                hs_seq = last_hidden_states[tok_start:tok_end].cpu()   # [T, H]
-                # Positions: use the seq's current seq_len as starting position
-                seq_len = int(input_batch.seq_lens_cpu_upper_bound[i])
-                T = tok_end - tok_start
-                pos = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
+                hs_seq    = last_hidden_states[tok_start:tok_end].cpu()
+                seq_len   = int(input_batch.seq_lens_cpu_upper_bound[i])
+                T         = tok_end - tok_start
+                pos       = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
                 self._send_prefill(seq_id, hs_seq, pos)
                 self._active_seqs.add(seq_id)
 
-        # ── build DECODE payload ─────────────────────────────────────────────
-        # For each request, extract the hidden state of the last token.
+        # ── build DECODE payload ──────────────────────────────────────────────
         decode_hs    = torch.zeros(num_reqs, last_hidden_states.shape[-1], dtype=torch.float16)
         decode_pos   = torch.zeros(num_reqs, dtype=torch.int64)
         decode_temps = temperature[:num_reqs].cpu().float()
         decode_seeds = seeds[:num_reqs].cpu()
 
         for i in range(num_reqs):
-            tok_end = int(qsl[i + 1]) - 1  # last token of this request
+            tok_end = int(qsl[i + 1]) - 1
             decode_hs[i]  = last_hidden_states[tok_end].cpu().to(torch.float16)
             decode_pos[i] = int(input_batch.seq_lens_cpu_upper_bound[i]) - 1
 
         draft_tokens_cpu = self._send_decode(
             req_ids, decode_hs, decode_pos, decode_temps, decode_seeds
-        )  # [num_reqs, K] int32
-
+        )
         self.draft_tokens[:num_reqs] = draft_tokens_cpu.to(
             device=self.device, dtype=torch.int64
         )
-        return self.draft_tokens[:num_reqs]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Lifecycle hooks called by the model runner
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def set_attn(self, *args, **kwargs) -> None:
+        pass
+
+    def load_draft_model(self, *args, **kwargs):
+        return None
 
     def set_eplb_state(self, eplb_state) -> None:
         pass
@@ -208,15 +253,12 @@ class DisaggDFlashProposer(BaseSpeculator):
         )
 
     # ──────────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # ZMQ helpers
+    # ZMQ helpers (rank 0 only)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _send(self, header: bytes, payload: bytes) -> tuple[bytes, bytes]:
         self._sock.send_multipart([b"", header, payload])
         parts = self._sock.recv_multipart()
-        # DEALER strips the empty frame; layout: [empty, header, payload]
         if len(parts) == 3:
             return parts[1], parts[2]
         if len(parts) == 2:
@@ -270,8 +312,10 @@ class DisaggDFlashProposer(BaseSpeculator):
 
     def __del__(self):
         try:
-            self._sock.close(linger=0)
-            self._zmq_ctx.destroy(linger=0)
+            if self._sock is not None:
+                self._sock.close(linger=0)
+            if self._zmq_ctx is not None:
+                self._zmq_ctx.destroy(linger=0)
         except Exception:
             pass
 
