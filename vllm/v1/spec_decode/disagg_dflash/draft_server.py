@@ -124,12 +124,12 @@ class DraftModelRunner:
 
         logger.info("Loading DFlash2 draft model: %s", self.draft_model_path)
 
-        kv_dtype = self.kv_cache_dtype if self.kv_cache_dtype != "auto" else None
+        kv_dtype = self.kv_cache_dtype if self.kv_cache_dtype not in (None, "auto") else "auto"
         engine_args = EngineArgs(
             model=self.draft_model_path,
             max_model_len=self.max_model_len,
             dtype=self.dtype_str,
-            gpu_memory_utilization=0.0,
+            gpu_memory_utilization=0.85,
             enforce_eager=True,
             trust_remote_code=True,
             tensor_parallel_size=1,
