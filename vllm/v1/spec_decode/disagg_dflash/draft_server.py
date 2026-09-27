@@ -234,17 +234,23 @@ class DraftModelRunner:
             self.num_blocks, num_layers, num_kv_heads, head_size, bs, self.device,
         )
 
-        # kv_cache[layer] = tensor of shape [2, num_blocks, block_size, num_kv_heads, head_size]
+        # kv_cache[layer] = (k_cache, v_cache) tuple, each [num_blocks, block_size, num_kv_heads, head_size]
+        # FlashInfer's do_kv_cache_update unpacks as k, v = kv_cache_layer.
         kv_dtype = torch.float8_e4m3fn if self.kv_cache_dtype == "fp8" \
                    else torch.float16
-        self.kv_cache: list[torch.Tensor] = []
+        self.kv_cache: list[tuple] = []
         for _ in range(num_layers):
-            t = torch.zeros(
-                2, self.num_blocks, bs, num_kv_heads, head_size,
+            k = torch.zeros(
+                self.num_blocks, bs, num_kv_heads, head_size,
                 dtype=kv_dtype,
                 device=self.device,
             )
-            self.kv_cache.append(t)
+            v = torch.zeros(
+                self.num_blocks, bs, num_kv_heads, head_size,
+                dtype=kv_dtype,
+                device=self.device,
+            )
+            self.kv_cache.append((k, v))
 
         # Inject into the model's attention layers so they can read/write KV.
         # vLLM v1 attention layers store kv_cache as a list attribute.
