@@ -142,14 +142,31 @@ class DraftModelRunner:
         # DFlash2DraftModel reads vllm_config.speculative_config.draft_model_config
         # from its own __init__. It was designed to run inside a spec-decode setup.
         # Inject a minimal stub so the model can find its own config.
+        # __getattr__ returns None for any unknown field so we don't chase
+        # individual attributes across every vLLM version bump.
         class _StubSpecConfig:
-            def __init__(self, mc):
+            def __init__(self, mc, k):
                 self.draft_model_config = mc
+                self.num_speculative_tokens = k
+                self.method = "dflash"
+                self.parallel_drafting = True
+                self.enable_adaptive_verification = False
+                self.rejection_sample_method = "standard"
+                self.draft_sample_method = "greedy"
+                self.use_local_argmax_reduction = False
+                self.use_heterogeneous_vocab = False
+                self.use_fp64_gumbel = False
+                self.disable_padded_drafter_batch = False
+                self.kv_cache_dtype = None
+                self.attention_backend = None
+
+            def __getattr__(self, name):
+                return None
 
         object.__setattr__(
             self.vllm_config,
             "speculative_config",
-            _StubSpecConfig(self.draft_model_config),
+            _StubSpecConfig(self.draft_model_config, self.num_speculative_tokens),
         )
 
         # vLLM model layers (e.g. VocabParallelEmbedding) require the
