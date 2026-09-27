@@ -144,8 +144,13 @@ class DisaggDFlashProposer(BaseSpeculator):
 
         # Only rank 0 contacts the draft server.
         if self._tp_rank == 0:
-            self._do_propose(input_batch, last_hidden_states, num_reqs,
-                             temperature, seeds)
+            try:
+                self._do_propose(input_batch, last_hidden_states, num_reqs,
+                                 temperature, seeds)
+            except Exception as exc:
+                # Log and continue — draft_tokens stay at zero.
+                # The broadcast below MUST still run so rank 1 doesn't deadlock.
+                logger.warning("DisaggDFlashProposer: draft server failed: %s", exc)
 
         # Broadcast the result from rank 0 to all other TP ranks.
         if tp_size > 1:
