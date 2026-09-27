@@ -139,6 +139,19 @@ class DraftModelRunner:
         self.vllm_config = engine_args.create_engine_config()
         self.draft_model_config = self.vllm_config.model_config
 
+        # DFlash2DraftModel reads vllm_config.speculative_config.draft_model_config
+        # from its own __init__. It was designed to run inside a spec-decode setup.
+        # Inject a minimal stub so the model can find its own config.
+        class _StubSpecConfig:
+            def __init__(self, mc):
+                self.draft_model_config = mc
+
+        object.__setattr__(
+            self.vllm_config,
+            "speculative_config",
+            _StubSpecConfig(self.draft_model_config),
+        )
+
         self.model = get_model(
             vllm_config=self.vllm_config,
             model_config=self.draft_model_config,
