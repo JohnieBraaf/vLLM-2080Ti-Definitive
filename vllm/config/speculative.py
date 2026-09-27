@@ -416,6 +416,11 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
     target model's `--kv-cache-dtype`."""
+    disagg_draft_address: str | None = None
+    """ZMQ address of a standalone draft server (e.g. "tcp://localhost:50052").
+    When set the draft model is NOT loaded on the main workers; instead the
+    DisaggDFlashProposer routes every proposal call to the remote server.
+    Only supported for method="dflash"."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""

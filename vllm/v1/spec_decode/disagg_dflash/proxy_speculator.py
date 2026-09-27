@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Proxy speculator that routes DFlash2 draft proposals to a remote draft server.
+
+Runs on the main workers (GPU 0,2). Implements the BaseSpeculator interface so
+the rest of the model runner is unaware that the draft model is on a different
+GPU.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import time
+from typing import Any
+
+import torch
+import zmq
+
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
+from vllm.v1.spec_decode.disagg_dflash.protocol import (
+    MSG_ACK,
+    build_decode,
+    build_free,
+    build_ping,
+    build_prefill,
+    parse_draft_response,
+    parse_header,
+)
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
+from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
+
+logger = init_logger(__name__)
+
+_TIMEOUT_MS = 10_000  # 10 s per request
+
+
+class DisaggDFlashProposer(BaseSpeculator):
+    """
+    Drop-in replacement for DFlashSpeculator that offloads the draft model to a
+    separate process on GPU1 via ZMQ.
+
+    The main model's hidden states are the only data that need to cross the
+    wire (≈112 KB per decode step at batch=8, Qwen3-27B hidden_size=7168).
+    """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.vllm_config = vllm_config
+        self.device = device
+        assert vllm_config.speculative_config is not None
+        spec = vllm_config.speculative_config
+        self.num_speculative_steps = spec.num_speculative_tokens
+        self.draft_model_config    = spec.draft_model_config
+        self.address               = spec.disagg_draft_address
+
+        max_reqs   = vllm_config.scheduler_config.max_num_seqs
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_reqs   = max_reqs
+        self.max_num_tokens = max_tokens
+        self.dtype = vllm_config.model_config.dtype
+
+        # Draft-token output buffer (returned to the model runner each step)
+        self.draft_tokens = torch.zeros(
+            max_reqs,
+            self.num_speculative_steps,
+            dtype=torch.int64,
+            device=device,
+        )
+
+        # Sequence tracking: seq_id → seen (for detecting prefill vs decode)
+        self._active_seqs: set[str] = set()
+
+        # ZMQ DEALER socket (one per process; the server is a ROUTER)
+        self._zmq_ctx  = zmq.Context()
+        self._sock     = self._zmq_ctx.socket(zmq.DEALER)
+        self._sock.setsockopt(zmq.RCVTIMEO, _TIMEOUT_MS)
+        self._sock.setsockopt(zmq.SNDTIMEO, _TIMEOUT_MS)
+        self._sock.connect(self.address)
+        logger.info("DisaggDFlashProposer connected to draft server at %s", self.address)
+
+        self._ping_server()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BaseSpeculator interface
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        # No CUDA graphs on the proxy side; the draft runs eagerly on GPU1
+        pass
+
+    def capture(self) -> None:
+        pass
+
+    def propose(
+        self,
+        input_batch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dp_sync: DPSyncState | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs=None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        if dummy_run:
+            return self.draft_tokens[: input_batch.num_reqs]
+
+        num_reqs = input_batch.num_reqs
+        req_ids  = list(input_batch.req_ids[:num_reqs])
+
+        # ── detect finished sequences and send FREE ──────────────────────────
+        current = set(req_ids)
+        finished = self._active_seqs - current
+        for seq_id in finished:
+            self._send_free(seq_id)
+        self._active_seqs = current
+
+        # ── detect new (prefill) sequences, send PREFILL ─────────────────────
+        # query_start_loc[i] .. query_start_loc[i+1] is the token range for req i
+        qsl = input_batch.query_start_loc_np  # numpy [num_reqs+1]
+        for i, seq_id in enumerate(req_ids):
+            if seq_id not in self._active_seqs or seq_id in finished:
+                # First time seeing this sequence — it's a prefill
+                tok_start = int(qsl[i])
+                tok_end   = int(qsl[i + 1])
+                hs_seq = last_hidden_states[tok_start:tok_end].cpu()   # [T, H]
+                # Positions: use the seq's current seq_len as starting position
+                seq_len = int(input_batch.seq_lens_np[i])
+                T = tok_end - tok_start
+                pos = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
+                self._send_prefill(seq_id, hs_seq, pos)
+                self._active_seqs.add(seq_id)
+
+        # ── build DECODE payload ─────────────────────────────────────────────
+        # For each request, extract the hidden state of the last token.
+        decode_hs    = torch.zeros(num_reqs, last_hidden_states.shape[-1], dtype=torch.float16)
+        decode_pos   = torch.zeros(num_reqs, dtype=torch.int64)
+        decode_temps = temperature[:num_reqs].cpu().float()
+        decode_seeds = seeds[:num_reqs].cpu()
+
+        for i in range(num_reqs):
+            tok_end = int(qsl[i + 1]) - 1  # last token of this request
+            decode_hs[i]  = last_hidden_states[tok_end].cpu().to(torch.float16)
+            decode_pos[i] = int(input_batch.seq_lens_np[i]) - 1
+
+        draft_tokens_cpu = self._send_decode(
+            req_ids, decode_hs, decode_pos, decode_temps, decode_seeds
+        )  # [num_reqs, K] int32
+
+        self.draft_tokens[:num_reqs] = draft_tokens_cpu.to(
+            device=self.device, dtype=torch.int64
+        )
+        return self.draft_tokens[:num_reqs]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Lifecycle hooks called by the model runner (optional overrides)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def set_attn(self, *args, **kwargs) -> None:
+        # No attention to set up on the proxy; the draft server manages its own.
+        pass
+
+    def load_draft_model(self, *args, **kwargs):
+        # No draft model on the main workers.
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ZMQ helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _send(self, header: bytes, payload: bytes) -> tuple[bytes, bytes]:
+        self._sock.send_multipart([b"", header, payload])
+        parts = self._sock.recv_multipart()
+        # DEALER strips the empty frame; layout: [empty, header, payload]
+        if len(parts) == 3:
+            return parts[1], parts[2]
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        raise RuntimeError(f"Unexpected ZMQ response frames: {len(parts)}")
+
+    def _ping_server(self) -> None:
+        h, _ = build_ping()
+        resp_h, _ = self._send(h, b"")
+        hdr = parse_header(resp_h)
+        if hdr.get("t") != MSG_ACK:
+            raise RuntimeError(f"Draft server ping failed: {hdr}")
+        logger.info("Draft server ping OK.")
+
+    def _send_prefill(
+        self,
+        seq_id: str,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        h, p = build_prefill(seq_id, hidden_states, positions)
+        resp_h, _ = self._send(h, p)
+        hdr = parse_header(resp_h)
+        if hdr.get("t") != MSG_ACK:
+            raise RuntimeError(f"PREFILL failed for {seq_id}: {hdr}")
+
+    def _send_decode(
+        self,
+        seq_ids: list[str],
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        temperatures: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> torch.Tensor:
+        h, p = build_decode(seq_ids, hidden_states, positions, temperatures, seeds)
+        resp_h, resp_p = self._send(h, p)
+        hdr = parse_header(resp_h)
+        if hdr.get("t") != MSG_ACK:
+            raise RuntimeError(f"DECODE failed: {hdr}")
+        return parse_draft_response(hdr, resp_p)
+
+    def _send_free(self, seq_id: str) -> None:
+        h, p = build_free(seq_id)
+        try:
+            resp_h, _ = self._send(h, p)
+            hdr = parse_header(resp_h)
+            if hdr.get("t") != MSG_ACK:
+                logger.warning("FREE ack unexpected for %s: %s", seq_id, hdr)
+        except Exception:
+            logger.warning("FREE for %s failed (server may have restarted)", seq_id)
+
+    def __del__(self):
+        try:
+            self._sock.close(linger=0)
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helper: write a config JSON for the draft server
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def write_draft_config(vllm_config: VllmConfig, path: str) -> None:
+        """Serialise the config fields that DraftModelRunner needs."""
+        spec = vllm_config.speculative_config
+        assert spec is not None
+        d = {
+            "speculative_config": {
+                "model": spec.draft_model_config.model,
+                "num_speculative_tokens": spec.num_speculative_tokens,
+                "kv_cache_dtype": str(spec.kv_cache_dtype) if spec.kv_cache_dtype else None,
+            },
+            "model_config": {
+                "max_model_len": vllm_config.model_config.max_model_len,
+                "dtype": str(vllm_config.model_config.dtype).replace("torch.", ""),
+            },
+            "cache_config": {
+                "block_size": vllm_config.cache_config.block_size,
+            },
+            "scheduler_config": {
+                "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
+                "max_num_batched_tokens": vllm_config.scheduler_config.max_num_batched_tokens,
+            },
+        }
+        with open(path, "w") as f:
+            json.dump(d, f, indent=2)
+        logger.info("Draft server config written to %s", path)
