@@ -139,11 +139,10 @@ class DisaggDFlashProposer(BaseSpeculator):
 
         # ── detect new (prefill) sequences, send PREFILL ─────────────────────
         # query_start_loc[i] .. query_start_loc[i+1] is the token range for req i
-        _qsl_raw = (
-            getattr(input_batch, "query_start_loc_np", None)
-            or getattr(input_batch, "query_start_loc", None)
-        )
-        qsl = _qsl_raw
+        _qsl = getattr(input_batch, "query_start_loc_np", None)
+        if _qsl is None:
+            _qsl = getattr(input_batch, "query_start_loc", None)
+        qsl = _qsl
         for i, seq_id in enumerate(req_ids):
             if seq_id not in self._active_seqs or seq_id in finished:
                 # First time seeing this sequence — it's a prefill
