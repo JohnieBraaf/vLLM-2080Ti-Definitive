@@ -124,7 +124,7 @@ class DisaggDFlashProposer(BaseSpeculator):
         mm_inputs=None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        if dummy_run:
+        if dummy_run or is_profile:
             return self.draft_tokens[: input_batch.num_reqs]
 
         num_reqs = input_batch.num_reqs
@@ -139,7 +139,11 @@ class DisaggDFlashProposer(BaseSpeculator):
 
         # ── detect new (prefill) sequences, send PREFILL ─────────────────────
         # query_start_loc[i] .. query_start_loc[i+1] is the token range for req i
-        qsl = input_batch.query_start_loc_np  # numpy [num_reqs+1]
+        _qsl_raw = (
+            getattr(input_batch, "query_start_loc_np", None)
+            or getattr(input_batch, "query_start_loc", None)
+        )
+        qsl = _qsl_raw
         for i, seq_id in enumerate(req_ids):
             if seq_id not in self._active_seqs or seq_id in finished:
                 # First time seeing this sequence — it's a prefill
@@ -147,7 +151,7 @@ class DisaggDFlashProposer(BaseSpeculator):
                 tok_end   = int(qsl[i + 1])
                 hs_seq = last_hidden_states[tok_start:tok_end].cpu()   # [T, H]
                 # Positions: use the seq's current seq_len as starting position
-                seq_len = int(input_batch.seq_lens_np[i])
+                seq_len = int(input_batch.seq_lens_cpu_upper_bound[i])
                 T = tok_end - tok_start
                 pos = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
                 self._send_prefill(seq_id, hs_seq, pos)
@@ -163,7 +167,7 @@ class DisaggDFlashProposer(BaseSpeculator):
         for i in range(num_reqs):
             tok_end = int(qsl[i + 1]) - 1  # last token of this request
             decode_hs[i]  = last_hidden_states[tok_end].cpu().to(torch.float16)
-            decode_pos[i] = int(input_batch.seq_lens_np[i]) - 1
+            decode_pos[i] = int(input_batch.seq_lens_cpu_upper_bound[i]) - 1
 
         draft_tokens_cpu = self._send_decode(
             req_ids, decode_hs, decode_pos, decode_temps, decode_seeds
