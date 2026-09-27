@@ -175,16 +175,16 @@ class DisaggDFlashProposer(BaseSpeculator):
         finished = self._active_seqs - current
         for seq_id in finished:
             self._send_free(seq_id)
-        self._active_seqs = current
 
         # ── detect new (prefill) sequences, send PREFILL ──────────────────────
+        # Check against the OLD _active_seqs BEFORE updating it.
         _qsl = getattr(input_batch, "query_start_loc_np", None)
         if _qsl is None:
             _qsl = getattr(input_batch, "query_start_loc", None)
         qsl = _qsl
 
         for i, seq_id in enumerate(req_ids):
-            if seq_id not in self._active_seqs or seq_id in finished:
+            if seq_id not in self._active_seqs:   # new sequence
                 tok_start = int(qsl[i])
                 tok_end   = int(qsl[i + 1])
                 hs_seq    = last_hidden_states[tok_start:tok_end].cpu()
@@ -192,7 +192,9 @@ class DisaggDFlashProposer(BaseSpeculator):
                 T         = tok_end - tok_start
                 pos       = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
                 self._send_prefill(seq_id, hs_seq, pos)
-                self._active_seqs.add(seq_id)
+
+        # Update tracking AFTER sending PREFILLs.
+        self._active_seqs = current
 
         # ── build DECODE payload ──────────────────────────────────────────────
         decode_hs    = torch.zeros(num_reqs, last_hidden_states.shape[-1], dtype=torch.float16)
