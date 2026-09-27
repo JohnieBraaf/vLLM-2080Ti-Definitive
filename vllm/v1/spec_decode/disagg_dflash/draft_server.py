@@ -106,19 +106,6 @@ class DraftModelRunner:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_vllm_config(self, d: dict) -> None:
-        """Reconstruct the VllmConfig from a serialised dict.
-
-        We extract only the fields we actually need; full deserialisation would
-        require pickling the entire config graph.
-        """
-        from vllm.config import (
-            CacheConfig,
-            ModelConfig,
-            ParallelConfig,
-            SchedulerConfig,
-            VllmConfig,
-        )
-
         spec = d["speculative_config"]
         self.draft_model_path = spec["model"]
         self.num_speculative_tokens = spec["num_speculative_tokens"]
@@ -129,79 +116,32 @@ class DraftModelRunner:
         self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[
             self.dtype_str
         ]
-
-        # Store enough of the original config for get_model()
         self._config_dict = d
 
     def _load_model(self) -> None:
-        from vllm.config import VllmConfig
+        from vllm.engine.arg_utils import EngineArgs
         from vllm.model_executor.model_loader import get_model
 
         logger.info("Loading DFlash2 draft model: %s", self.draft_model_path)
 
-        # Build a minimal VllmConfig that get_model() accepts.
-        # We re-use the original config but override model to point at the
-        # draft model and remove speculative decoding.
-        from vllm.config import (
-            AttentionConfig,
-            CacheConfig,
-            CompilationConfig,
-            DeviceConfig,
-            LoadConfig,
-            ModelConfig,
-            ParallelConfig,
-            SchedulerConfig,
-        )
-        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
-
-        d = self._config_dict
-        spec = d["speculative_config"]
-
-        draft_model_config = ModelConfig(
-            model=spec["model"],
-            task="auto",
-            tokenizer=spec["model"],
-            tokenizer_mode="auto",
-            trust_remote_code=True,
-            dtype=self.dtype_str,
-            seed=0,
+        kv_dtype = self.kv_cache_dtype if self.kv_cache_dtype != "auto" else None
+        engine_args = EngineArgs(
+            model=self.draft_model_path,
             max_model_len=self.max_model_len,
+            dtype=self.dtype_str,
+            gpu_memory_utilization=0.0,
+            enforce_eager=True,
+            trust_remote_code=True,
+            tensor_parallel_size=1,
+            kv_cache_dtype=kv_dtype,
+            disable_log_stats=True,
         )
-        self.draft_model_config = draft_model_config
-
-        parallel_config = ParallelConfig(tensor_parallel_size=1)
-        cache_config = CacheConfig(
-            block_size=self.block_size,
-            gpu_memory_utilization=0.0,  # we manage memory ourselves
-            swap_space_bytes=0,
-            cache_dtype=self.kv_cache_dtype,
-        )
-        use_non_causal = dflash_has_any_non_causal(draft_model_config.hf_config)
-        attn_config = AttentionConfig(use_non_causal=use_non_causal)
-
-        load_config = LoadConfig()
-        compilation_config = CompilationConfig(level=0)
-
-        self.vllm_config = VllmConfig(
-            model_config=draft_model_config,
-            parallel_config=parallel_config,
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=d["scheduler_config"]["max_num_seqs"],
-                max_num_batched_tokens=d["scheduler_config"][
-                    "max_num_batched_tokens"
-                ],
-            ),
-            cache_config=cache_config,
-            load_config=load_config,
-            device_config=DeviceConfig(device=str(self.device)),
-            attention_config=attn_config,
-            compilation_config=compilation_config,
-            speculative_config=None,  # no spec decode on the draft server
-        )
+        self.vllm_config = engine_args.create_engine_config()
+        self.draft_model_config = self.vllm_config.model_config
 
         self.model = get_model(
             vllm_config=self.vllm_config,
-            model_config=draft_model_config,
+            model_config=self.draft_model_config,
         )
         self.model.to(self.device)
         self.model.eval()
