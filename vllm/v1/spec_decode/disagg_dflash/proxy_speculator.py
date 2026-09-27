@@ -69,6 +69,18 @@ class DisaggDFlashProposer(BaseSpeculator):
             device=device,
         )
 
+        # Attributes expected by the model runner (DraftModelSpeculator contract).
+        # We don't load a draft model on the main workers, so set sensible stubs.
+        self.supports_mm_inputs = False
+        self.uses_mrope = False
+        self.needs_extra_input_slots = False
+        self.parallel_drafting = True
+        self.draft_is_prefilling = torch.zeros(max_reqs, dtype=torch.bool)
+        self.idx_mapping = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self.hidden_size = spec.draft_model_config.get_hidden_size()
+        self.vocab_size = spec.draft_model_config.get_vocab_size()
+        self.max_model_len = vllm_config.model_config.max_model_len
+
         # Sequence tracking: seq_id → seen (for detecting prefill vs decode)
         self._active_seqs: set[str] = set()
 
@@ -162,17 +174,37 @@ class DisaggDFlashProposer(BaseSpeculator):
         )
         return self.draft_tokens[:num_reqs]
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Lifecycle hooks called by the model runner (optional overrides)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def set_attn(self, *args, **kwargs) -> None:
-        # No attention to set up on the proxy; the draft server manages its own.
+    def set_eplb_state(self, eplb_state) -> None:
         pass
 
-    def load_draft_model(self, *args, **kwargs):
-        # No draft model on the main workers.
-        return None
+    def set_num_cached_tokens(self, num_cached_tokens) -> None:
+        pass
+
+    def __getattr__(self, name: str):
+        """Catch-all for any DraftModelSpeculator attributes the model runner
+        reads but the proxy doesn't need to implement."""
+        _false = {
+            "use_local_argmax_reduction", "use_heterogeneous_vocab",
+            "use_fp64_gumbel", "_share_mtp_indices",
+            "_enable_probabilistic_draft_probs", "constant_draft_positions",
+        }
+        if name in _false:
+            return False
+        _none = {
+            "pcp_manager", "eplb_state", "model", "vocab_mapping",
+            "draft_logits", "draft_watermarker", "allowed_attn_types",
+            "_last_draft_probs", "backup_next_token_ids",
+        }
+        if name in _none:
+            return None
+        _empty = {"attn_groups", "draft_attn_groups"}
+        if name in _empty:
+            return []
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
 
     # ──────────────────────────────────────────────────────────────────────────
     # ZMQ helpers
