@@ -152,11 +152,28 @@ class DraftModelRunner:
             _StubSpecConfig(self.draft_model_config),
         )
 
+        # vLLM model layers (e.g. VocabParallelEmbedding) require the
+        # distributed TP group to be initialised even for a single GPU.
+        import os
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12356")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        init_distributed_environment(world_size=1, rank=0, local_rank=self.device.index or 0)
+        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
         self.model = get_model(
             vllm_config=self.vllm_config,
             model_config=self.draft_model_config,
         )
-        self.model.to(self.device)
         self.model.eval()
         logger.info("Draft model loaded.")
 
