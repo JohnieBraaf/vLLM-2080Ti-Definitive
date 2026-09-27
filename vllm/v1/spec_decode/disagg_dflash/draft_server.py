@@ -156,6 +156,7 @@ class DraftModelRunner:
         # distributed TP group to be initialised even for a single GPU.
         import os
         import torch.distributed as dist
+        from vllm.config import set_current_vllm_config
         from vllm.distributed.parallel_state import (
             init_distributed_environment,
             initialize_model_parallel,
@@ -168,6 +169,12 @@ class DraftModelRunner:
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
         init_distributed_environment(world_size=1, rank=0, local_rank=self.device.index or 0)
+
+        # Keep the vllm config context active for the entire process lifetime.
+        # initialize_model_parallel and get_model both call get_current_vllm_config().
+        self._vllm_config_ctx = set_current_vllm_config(self.vllm_config)
+        self._vllm_config_ctx.__enter__()
+
         initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
         self.model = get_model(
