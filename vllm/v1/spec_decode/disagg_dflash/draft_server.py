@@ -243,16 +243,20 @@ class DraftModelRunner:
             KVCacheGroupSpec,
             KVCacheTensor,
             UniformTypeKVCacheSpecs,
-            get_kv_cache_spec,
         )
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
         from vllm.v1.kv_cache_layout import KVCacheLayout
         from vllm.v1.worker.gpu.attn_utils import init_attn_backend
         from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache_to_layers
         from vllm.config import get_layers_from_vllm_config
         from vllm.model_executor.layers.attention import Attention
 
-        # ── Step 1: per-layer KV specs from the model config ─────────────────
-        kv_specs = get_kv_cache_spec(self.vllm_config)
+        # ── Step 1: per-layer KV specs from the loaded model's attention layers ─
+        _all_attn = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        kv_specs = {
+            _n: _s for _n, _layer in _all_attn.items()
+            if (_s := _layer.get_kv_cache_spec(self.vllm_config)) is not None
+        }
 
         # Filter to attention specs only (skip Mamba / GDN state).
         def _is_attn(spec) -> bool:
