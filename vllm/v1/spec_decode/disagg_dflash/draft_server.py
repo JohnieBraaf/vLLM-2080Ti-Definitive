@@ -322,6 +322,30 @@ class DraftModelRunner:
             kv_cache_config, self.vllm_config, self.device
         )
 
+        # ── Step 4b: resolve KV cache layout (engine core normally does this) ─────
+        # build_for_drafting raises if this is skipped.
+        from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+        _supported: list[list[str]] = []
+        for _gl in self.attn_groups:
+            for _g in _gl:
+                _mb  = _g.get_metadata_builder()
+                _fn  = getattr(_mb, "get_supported_kv_cache_layouts", None)
+                if _fn is None:
+                    _fn = getattr(
+                        getattr(_g, "attn_backend", None),
+                        "get_supported_kv_cache_layouts", None,
+                    )
+                if _fn is not None:
+                    _supported.append(_fn())
+        _layout = resolve_kv_cache_layout(
+            self.vllm_config,
+            _supported,
+            kv_cache_specs=list(kv_specs.values()),
+        )
+        # Propagate to kv_cache_config if it exposes the field.
+        if hasattr(kv_cache_config, "kv_cache_layout"):
+            object.__setattr__(kv_cache_config, "kv_cache_layout", _layout)
+
         # ── Step 5: allocate KV tensors in the correct physical layout ────────
         layout   = KVCacheLayout[os.environ.get("VLLM_KV_CACHE_LAYOUT", "BLHNC")]
         kv_caches = allocate_kv_cache(kv_cache_config, self.device, layout)
