@@ -323,19 +323,16 @@ class DraftModelRunner:
         )
 
         # ── Step 4b: resolve KV cache layout (engine core normally does this) ─────
-        # build_for_drafting raises if this is skipped.
-        # resolve_kv_cache_layout() asserts supported_layouts is non-empty;
-        # bypass it by setting cache_config.kv_cache_layout directly so the
-        # function short-circuits.  The VLLM_KV_CACHE_LAYOUT env var is already
-        # set in the systemd service to "BLHNC".
-        _layout = KVCacheLayout[os.environ.get("VLLM_KV_CACHE_LAYOUT", "BLHNC")]
-        object.__setattr__(self.vllm_config.cache_config, "kv_cache_layout", _layout)
-        # Propagate to kv_cache_config if it exposes the field.
+        # build_for_drafting compares layout against a list of strings like
+        # ['BLHNC', 'LBHNC', ...].  Store the layout NAME (string), not the
+        # KVCacheLayout enum, so the comparison succeeds.
+        _layout_str = os.environ.get("VLLM_KV_CACHE_LAYOUT", "BLHNC")
+        object.__setattr__(self.vllm_config.cache_config, "kv_cache_layout", _layout_str)
         if hasattr(kv_cache_config, "kv_cache_layout"):
-            object.__setattr__(kv_cache_config, "kv_cache_layout", _layout)
+            object.__setattr__(kv_cache_config, "kv_cache_layout", _layout_str)
 
         # ── Step 5: allocate KV tensors in the correct physical layout ────────
-        layout   = KVCacheLayout[os.environ.get("VLLM_KV_CACHE_LAYOUT", "BLHNC")]
+        layout    = KVCacheLayout[_layout_str]  # enum required by allocate_kv_cache
         kv_caches = allocate_kv_cache(kv_cache_config, self.device, layout)
         self.kv_caches = kv_caches
 
