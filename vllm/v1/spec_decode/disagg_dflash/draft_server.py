@@ -165,6 +165,10 @@ class DraftModelRunner:
             tensor_parallel_size=1,
             kv_cache_dtype=kv_dtype,
             disable_log_stats=True,
+            # Required for DFlash2’s GDN cross-attention to use the
+            # FlashQLA legacy SM75-optimised kernel instead of falling back
+            # to a generic implementation that produces wrong results.
+            additional_config={"gdn_prefill_backend": "flashqla_legacy"},
         )
         self.vllm_config = engine_args.create_engine_config()
         self.draft_model_config = self.vllm_config.model_config
