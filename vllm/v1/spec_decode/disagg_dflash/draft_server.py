@@ -457,13 +457,16 @@ class DraftModelRunner:
             for j in range(num_query_per_req):
                 query_positions[i * num_query_per_req + j] = base + j
 
-        # Slot mapping for query tokens (allocate fresh slots).
+        # Slot mapping for query tokens.
+        # The bonus slot (j=0) reuses position T_old = positions[i] — the same
+        # slot where precompute_and_store_context_kv just wrote the new token's
+        # K/V.  Mask slots follow at T_old+1 .. T_old+K.
         query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
-            blocks = self.seq_block_tables[seq_id]
-            T      = self.seq_lengths[seq_id]
+            blocks   = self.seq_block_tables[seq_id]
+            T_bonus  = int(positions[i].item())   # = T_old (bonus position)
             for j in range(num_query_per_req):
-                pos = T + j  # slots for query tokens after the context
+                pos = T_bonus + j                 # T_old, T_old+1, …, T_old+K
                 while pos >= len(blocks) * bs:
                     blocks.append(self.block_manager.allocate_one())
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
