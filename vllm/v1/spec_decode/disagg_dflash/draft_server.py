@@ -129,7 +129,7 @@ class DraftModelRunner:
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="gloo")  # gloo=CPU-only, no GPU resource leak
         init_distributed_environment(
             world_size=1, rank=0,
             local_rank=self.device.index or 0,
@@ -219,7 +219,7 @@ class DraftModelRunner:
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="gloo")  # gloo=CPU-only, no GPU resource leak
         init_distributed_environment(
             world_size=1, rank=0,
             local_rank=self.device.index or 0,
