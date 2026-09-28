@@ -430,10 +430,6 @@ class DraftModelRunner:
             dtype=torch.int32, device=self.device,
         )
         max_ctx = int(context_lens.max().item())
-        max_blk = (max_ctx + bs - 1) // bs
-
-        block_tables = self._build_block_table_tensor(seq_ids, max_blk)
-
         # ── query layout: [bonus_token, mask_1, …, mask_K] per request ───────
         num_query_per_req = 1 + K
         num_query_total   = B * num_query_per_req
@@ -462,6 +458,10 @@ class DraftModelRunner:
                 while pos >= len(blocks) * bs:
                     blocks.append(self.block_manager.allocate_one())
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
+
+        # Build block tables AFTER query slot allocation, which may extend block tables.
+        max_blk = max(len(self.seq_block_tables[sid]) for sid in seq_ids)
+        block_tables = self._build_block_table_tensor(seq_ids, max_blk)
 
         # query_start_loc [B+1]
         query_start_loc = (
