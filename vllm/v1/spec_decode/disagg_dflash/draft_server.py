@@ -208,6 +208,12 @@ class DraftModelRunner:
             init_distributed_environment,
             initialize_model_parallel,
         )
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12356")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
         init_distributed_environment(
             world_size=1, rank=0,
             local_rank=self.device.index or 0,
