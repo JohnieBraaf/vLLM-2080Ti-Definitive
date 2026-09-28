@@ -500,11 +500,13 @@ class DraftModelRunner:
 
         # Slot mapping for query tokens.
         # The bonus slot (j=0) reuses position T_old = positions[i] — the same
-        # slot where precompute_and_store_context_kv just wrote the new token's
-        # K/V.  Mask slots follow at T_old+1 .. T_old+K.
+        # Allocate query slots. Save the pre-query block count per sequence so
+        # we can release the temporary query blocks after the forward pass.
+        pre_query_counts: list[int] = []
         query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
             blocks   = self.seq_block_tables[seq_id]
+            pre_query_counts.append(len(blocks))   # save BEFORE extending
             T_bonus  = int(positions[i].item())   # = T_old (bonus position)
             for j in range(num_query_per_req):
                 pos = T_bonus + j                 # T_old, T_old+1, …, T_old+K
@@ -579,6 +581,16 @@ class DraftModelRunner:
             else logits.view(-1, logits.shape[-1])
         )
         draft_tokens = flat_logits[sample_idx].argmax(dim=-1).int().view(B, K)
+
+        # Release the temporary query blocks — they are not part of the committed
+        # sequence and must be freed each step or the block pool exhausts.
+        for _i, _sid in enumerate(seq_ids):
+            _blks = self.seq_block_tables[_sid]
+            _extra = _blks[pre_query_counts[_i]:]
+            del _blks[pre_query_counts[_i]:]
+            if _extra:
+                self.block_manager.free(_extra)
+
         return draft_tokens
 
     # ──────────────────────────────────────────────────────────────────────────
