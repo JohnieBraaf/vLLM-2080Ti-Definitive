@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Standalone draft server for disaggregated DFlash2 speculative decoding.
 
-Run on GPU1 (the non-NVLink GPU):
+v2: uses vLLM's proper KV cache infrastructure (init_attn_backend,
+allocate_kv_cache, bind_kv_cache_to_layers) so FlashInfer attention
+works correctly for both the KV-write path (precompute_and_store_context_kv)
+and the KV-read path (model forward producing draft tokens).
+
+Run on GPU1:
     python -m vllm.v1.spec_decode.disagg_dflash.draft_server \
         --device 1 \
         --address tcp://0.0.0.0:50052 \
         --config-json /tmp/dflash_draft_config.json
-
-The config JSON is a serialised VllmConfig produced by the proxy at startup.
 """
 
 from __future__ import annotations
@@ -16,12 +19,8 @@ import argparse
 import json
 import os
 import signal
-import sys
 import time
-from typing import Any
 
-import msgpack
-import numpy as np
 import torch
 import zmq
 
@@ -29,7 +28,6 @@ from vllm.logger import init_logger
 from vllm.v1.spec_decode.disagg_dflash.protocol import (
     MSG_ACK,
     MSG_DECODE,
-    MSG_ERROR,
     MSG_FREE,
     MSG_PING,
     MSG_PREFILL,
@@ -76,11 +74,11 @@ class DraftModelRunner:
     Loads the DFlash2 model on a single GPU and serves hidden-state-based
     draft proposals.
 
-    Initialisation mirrors what GPUModelRunner does for the draft speculator,
-    but only for the pieces needed by a standalone process:
-      - model weights loaded via get_model()
-      - KV cache allocated directly on the device
-      - attention set up via vLLM's existing backend
+    v2 uses vLLM's proper KV cache infrastructure:
+      - get_kv_cache_spec() for per-layer specs
+      - init_attn_backend() for FlashInfer attention groups
+      - allocate_kv_cache() for properly-formatted KV tensors
+      - bind_kv_cache_to_layers() to bind KV into attention layers
     """
 
     def __init__(self, vllm_config_dict: dict, device: torch.device):
@@ -88,11 +86,11 @@ class DraftModelRunner:
         torch.cuda.set_device(device)
 
         self._build_vllm_config(vllm_config_dict)
+        self._init_distributed()
         self._load_model()
         self._init_kv_cache()
         self._init_block_manager()
 
-        # Per-sequence state: block_table and current length
         self.seq_block_tables: dict[str, list[int]] = {}
         self.seq_lengths:      dict[str, int]       = {}
 
@@ -102,15 +100,14 @@ class DraftModelRunner:
         )
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Initialisation helpers
+    # Initialisation
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_vllm_config(self, d: dict) -> None:
         spec = d["speculative_config"]
         self.draft_model_path = spec["model"]
         self.num_speculative_tokens = spec["num_speculative_tokens"]
-        self.kv_cache_dtype = spec.get("kv_cache_dtype") or "auto"
-        self.block_size = d.get("cache_config", {}).get("block_size", 16)
+        self.kv_cache_dtype_str = spec.get("kv_cache_dtype") or "auto"
         self.max_model_len = d["model_config"]["max_model_len"]
         self.dtype_str = d["model_config"].get("dtype", "float16")
         self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[
@@ -118,18 +115,50 @@ class DraftModelRunner:
         ]
         self._config_dict = d
 
+    def _init_distributed(self) -> None:
+        import torch.distributed as dist
+        from vllm.config import set_current_vllm_config
+        from vllm.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12356")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        init_distributed_environment(
+            world_size=1, rank=0,
+            local_rank=self.device.index or 0,
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        # Temporarily set a minimal config so get_current_vllm_config() works
+        # during initialize_model_parallel. We'll replace it after EngineArgs.
+        # (Some internal vLLM calls read the global config during init.)
+
     def _load_model(self) -> None:
         from vllm.engine.arg_utils import EngineArgs
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader import get_model
+        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
         logger.info("Loading DFlash2 draft model: %s", self.draft_model_path)
 
-        kv_dtype = self.kv_cache_dtype if self.kv_cache_dtype not in (None, "auto") else "auto"
+        kv_dtype = (
+            self.kv_cache_dtype_str
+            if self.kv_cache_dtype_str not in (None, "auto")
+            else "auto"
+        )
         engine_args = EngineArgs(
             model=self.draft_model_path,
             max_model_len=self.max_model_len,
             dtype=self.dtype_str,
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=0.01,  # we allocate KV cache ourselves
             enforce_eager=True,
             trust_remote_code=True,
             tensor_parallel_size=1,
@@ -140,10 +169,7 @@ class DraftModelRunner:
         self.draft_model_config = self.vllm_config.model_config
 
         # DFlash2DraftModel reads vllm_config.speculative_config.draft_model_config
-        # from its own __init__. It was designed to run inside a spec-decode setup.
-        # Inject a minimal stub so the model can find its own config.
-        # __getattr__ returns None for any unknown field so we don't chase
-        # individual attributes across every vLLM version bump.
+        # from its __init__. Inject a stub with __getattr__ fallback.
         class _StubSpecConfig:
             def __init__(self, mc, k):
                 self.draft_model_config = mc
@@ -169,30 +195,28 @@ class DraftModelRunner:
             _StubSpecConfig(self.draft_model_config, self.num_speculative_tokens),
         )
 
-        # vLLM model layers (e.g. VocabParallelEmbedding) require the
-        # distributed TP group to be initialised even for a single GPU.
-        import os
+        # Keep the vllm config context active for the entire process lifetime.
+        self._vllm_config_ctx = set_current_vllm_config(self.vllm_config)
+        self._vllm_config_ctx.__enter__()
+
+        self.requires_non_causal = dflash_has_any_non_causal(
+            self.draft_model_config.hf_config
+        )
+
+        # Initialize distributed TP group (needed by VocabParallelEmbedding etc.)
         import torch.distributed as dist
-        from vllm.config import set_current_vllm_config
         from vllm.distributed.parallel_state import (
             init_distributed_environment,
             initialize_model_parallel,
         )
-
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12356")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        init_distributed_environment(world_size=1, rank=0, local_rank=self.device.index or 0)
-
-        # Keep the vllm config context active for the entire process lifetime.
-        # initialize_model_parallel and get_model both call get_current_vllm_config().
-        self._vllm_config_ctx = set_current_vllm_config(self.vllm_config)
-        self._vllm_config_ctx.__enter__()
-
-        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        init_distributed_environment(
+            world_size=1, rank=0,
+            local_rank=self.device.index or 0,
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
 
         self.model = get_model(
             vllm_config=self.vllm_config,
@@ -202,68 +226,106 @@ class DraftModelRunner:
         logger.info("Draft model loaded.")
 
     def _init_kv_cache(self) -> None:
-        """Allocate per-layer KV cache tensors on GPU1 and inject them."""
-        from vllm.config import ParallelConfig
+        """Initialise KV cache using vLLM's proper infrastructure.
 
-        cfg = self.draft_model_config
-        par = ParallelConfig(tensor_parallel_size=1)
+        Uses get_kv_cache_spec → KVCacheConfig → init_attn_backend →
+        allocate_kv_cache → bind_kv_cache_to_layers so FlashInfer
+        attention is correctly wired for both writes and reads.
+        """
+        from vllm.v1.kv_cache_interface import (
+            AttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            KVCacheTensor,
+            UniformTypeKVCacheSpecs,
+            get_kv_cache_spec,
+        )
+        from vllm.v1.kv_cache_layout import KVCacheLayout
+        from vllm.v1.worker.gpu.attn_utils import init_attn_backend
+        from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache_to_layers
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
 
-        num_layers  = cfg.get_num_layers(par)
-        num_kv_heads = cfg.get_num_kv_heads(par)
-        head_size   = cfg.get_head_size()
-        bs          = self.block_size
+        # ── Step 1: per-layer KV specs from the model config ─────────────────
+        kv_specs = get_kv_cache_spec(self.vllm_config)
 
-        # Estimate free memory after model weights
+        # Filter to attention specs only (skip Mamba / GDN state).
+        def _is_attn(spec) -> bool:
+            if isinstance(spec, AttentionSpec):
+                return True
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                return any(isinstance(s, AttentionSpec) for s in spec.kv_cache_specs.values())
+            return False
+
+        attn_specs: dict = {n: s for n, s in kv_specs.items() if _is_attn(s)}
+        if not attn_specs:
+            raise RuntimeError("No attention layers found in draft model")
+
+        # Resolve first concrete AttentionSpec for sizing.
+        first_spec = next(iter(attn_specs.values()))
+        if isinstance(first_spec, UniformTypeKVCacheSpecs):
+            first_spec = next(iter(first_spec.kv_cache_specs.values()))
+
+        num_kv_heads  = first_spec.num_kv_heads
+        head_size     = first_spec.head_size
+        bs            = first_spec.block_size
+        self.block_size = bs
+
+        # ── Step 2: compute num_blocks from free memory ───────────────────────
         torch.cuda.synchronize(self.device)
-        free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
-        # Reserve 1 GB for activations / overhead
-        usable = max(0, free_mem - 1 * 1024**3)
+        free_bytes, _ = torch.cuda.mem_get_info(self.device.index)
+        usable_bytes  = max(0, free_bytes - 1 * 1024 ** 3)  # 1 GB overhead
 
-        bytes_per_block = (
-            2  # K and V
-            * num_layers
-            * num_kv_heads
-            * head_size
-            * bs
-            * 2  # float16
-        )
-        self.num_blocks = max(1, int(usable // bytes_per_block))
+        # k + v, float16 (2 bytes), [num_kv_heads, block_size, head_size]
+        block_page_bytes = 2 * num_kv_heads * bs * head_size * 2
+        num_attn_layers  = len(attn_specs)
+        self.num_blocks  = max(1, int(usable_bytes // (num_attn_layers * block_page_bytes)))
+
         logger.info(
-            "Allocating %d KV blocks (%d layers, %d heads, head_size=%d, "
-            "block_size=%d) on %s",
-            self.num_blocks, num_layers, num_kv_heads, head_size, bs, self.device,
+            "Allocating %d KV blocks (%d attn layers, %d heads, "
+            "head_size=%d, block_size=%d) on %s",
+            self.num_blocks, num_attn_layers, num_kv_heads,
+            head_size, bs, self.device,
         )
 
-        # kv_cache[layer] = (k_cache, v_cache) tuple, each [num_blocks, block_size, num_kv_heads, head_size]
-        # FlashInfer's do_kv_cache_update unpacks as k, v = kv_cache_layer.
-        kv_dtype = torch.float8_e4m3fn if self.kv_cache_dtype == "fp8" \
-                   else torch.float16
-        self.kv_cache: list[tuple] = []
-        for _ in range(num_layers):
-            k = torch.zeros(
-                self.num_blocks, bs, num_kv_heads, head_size,
-                dtype=kv_dtype,
-                device=self.device,
-            )
-            v = torch.zeros(
-                self.num_blocks, bs, num_kv_heads, head_size,
-                dtype=kv_dtype,
-                device=self.device,
-            )
-            self.kv_cache.append((k, v))
+        # ── Step 3: build KVCacheConfig ───────────────────────────────────────
+        attn_names   = list(attn_specs.keys())
+        layer_stride = self.num_blocks * block_page_bytes  # layer-outermost
+        kv_tensor    = KVCacheTensor(
+            size         = num_attn_layers * layer_stride,
+            layers       = attn_names,
+            layer_stride = layer_stride,
+            block_stride = block_page_bytes,
+        )
+        kv_group = KVCacheGroupSpec(
+            layer_names   = attn_names,
+            kv_cache_spec = first_spec,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks        = self.num_blocks,
+            kv_cache_tensors  = [kv_tensor],
+            kv_cache_groups   = [kv_group],
+        )
+        self.kv_cache_config = kv_cache_config
 
-        # Inject into the model's attention layers so they can read/write KV.
-        # vLLM v1 attention layers store kv_cache as a list attribute.
-        layer_idx = 0
-        for name, module in self.model.named_modules():
-            if hasattr(module, "kv_cache"):
-                if layer_idx < len(self.kv_cache):
-                    module.kv_cache = self.kv_cache[layer_idx]
-                    layer_idx += 1
+        # ── Step 4: init_attn_backend → attn_groups with FlashInfer ──────────
+        self.attn_groups, _, _ = init_attn_backend(
+            kv_cache_config, self.vllm_config, self.device
+        )
+
+        # ── Step 5: allocate KV tensors in the correct physical layout ────────
+        layout   = KVCacheLayout[os.environ.get("VLLM_KV_CACHE_LAYOUT", "BLHNC")]
+        kv_caches = allocate_kv_cache(kv_cache_config, self.device, layout)
+        self.kv_caches = kv_caches
+
+        # ── Step 6: bind KV cache into attention layers ───────────────────────
+        # bind_kv_cache_to_layers calls layer.bind_kv_cache(tensor) which is
+        # the correct API — not module.kv_cache = tensor.
+        fwd_ctx = get_layers_from_vllm_config(self.vllm_config, Attention)
+        bind_kv_cache_to_layers(kv_caches, fwd_ctx)
 
         self.num_kv_heads = num_kv_heads
         self.head_size    = head_size
-        self.num_layers   = num_layers
 
     def _init_block_manager(self) -> None:
         self.block_manager = SimpleBlockManager(self.num_blocks, self.block_size)
@@ -283,15 +345,16 @@ class DraftModelRunner:
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         positions     = positions.to(device=self.device)
 
-        # Allocate KV blocks for this sequence
-        blocks = self.block_manager.allocate(T)
+        blocks       = self.block_manager.allocate(T)
         self.seq_block_tables[seq_id] = blocks
         self.seq_lengths[seq_id]      = T
 
-        # Compute slot mapping: token i → block[i // bs] * bs + (i % bs)
         slot_mapping = self._compute_slot_mapping_for_sequence(blocks, T)
 
-        # Project context hidden states into KV cache
+        # precompute_and_store_context_kv is a direct KV write; no forward
+        # context required — it writes via FlashInfer's do_kv_cache_update using
+        # the slot_mapping, and the attention layers are already bound via
+        # bind_kv_cache_to_layers.
         self.model.precompute_and_store_context_kv(
             hidden_states,
             positions,
@@ -302,42 +365,32 @@ class DraftModelRunner:
     @torch.inference_mode()
     def handle_decode(
         self,
-        seq_ids:      list[str],
-        hidden_states: torch.Tensor,  # [B, H] — one new token per sequence
+        seq_ids:       list[str],
+        hidden_states: torch.Tensor,  # [B, H]
         positions:     torch.Tensor,  # [B]
         temperatures:  torch.Tensor,  # [B]
         seeds:         torch.Tensor,  # [B]
     ) -> torch.Tensor:                # [B, K]
         B = len(seq_ids)
-        K = self.num_speculative_tokens
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         positions     = positions.to(device=self.device)
-        temperatures  = temperatures.to(device=self.device)
-        seeds         = seeds.to(device=self.device)
 
-        # 1. Extend each sequence's KV cache with the new token's hidden state
+        # Extend each sequence with the newly generated token's KV.
         for i, seq_id in enumerate(seq_ids):
             T_old = self.seq_lengths[seq_id]
             T_new = T_old + 1
             blocks = self.seq_block_tables[seq_id]
-
-            # Allocate a new block if the current one is full
             if T_new > len(blocks) * self.block_size:
                 blocks.append(self.block_manager.allocate_one())
 
             new_slot = self._slot_for_position(blocks, T_old)
-            hs_i = hidden_states[i].unsqueeze(0)    # [1, H]
-            pos_i = positions[i].unsqueeze(0)        # [1]
-            slot_i = torch.tensor([new_slot], device=self.device, dtype=torch.int64)
-
+            hs_i     = hidden_states[i].unsqueeze(0)
+            pos_i    = positions[i].unsqueeze(0)
+            slot_i   = torch.tensor([new_slot], device=self.device, dtype=torch.int64)
             self.model.precompute_and_store_context_kv(hs_i, pos_i, slot_i)
             self.seq_lengths[seq_id] = T_new
 
-        # 2. Build query input: for each request, (bonus_pos, mask_pos × K)
-        #    bonus token = the new token id (last sampled) → we use the hidden state
-        #    mask tokens = the model's special mask_token_id
-        draft_token_ids = self._run_draft_forward(seq_ids, positions, temperatures, seeds)
-        return draft_token_ids  # [B, K]
+        return self._run_draft_forward(seq_ids, positions)
 
     def handle_free(self, seq_id: str) -> None:
         blocks = self.seq_block_tables.pop(seq_id, [])
@@ -346,118 +399,103 @@ class DraftModelRunner:
         logger.debug("FREE seq=%s released %d blocks", seq_id, len(blocks))
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Internal helpers
+    # Draft forward pass (v2: proper FlashInfer metadata via attn_groups)
     # ──────────────────────────────────────────────────────────────────────────
-
-    def _compute_slot_mapping_for_sequence(
-        self, blocks: list[int], num_tokens: int
-    ) -> torch.Tensor:
-        slots = []
-        for i in range(num_tokens):
-            slots.append(self._slot_for_position(blocks, i))
-        return torch.tensor(slots, dtype=torch.int64, device=self.device)
-
-    def _slot_for_position(self, blocks: list[int], pos: int) -> int:
-        block_idx = pos // self.block_size
-        offset    = pos  % self.block_size
-        return blocks[block_idx] * self.block_size + offset
-
-    def _build_block_table_tensor(
-        self, seq_ids: list[str], max_blocks: int
-    ) -> torch.Tensor:
-        B = len(seq_ids)
-        bt = torch.zeros(B, max_blocks, dtype=torch.int32, device=self.device)
-        for i, seq_id in enumerate(seq_ids):
-            blocks = self.seq_block_tables[seq_id]
-            bt[i, : len(blocks)] = torch.tensor(
-                blocks, dtype=torch.int32, device=self.device
-            )
-        return bt
 
     def _run_draft_forward(
         self,
-        seq_ids:     list[str],
-        positions:   torch.Tensor,   # [B] — positions of newly added tokens
-        temperatures: torch.Tensor,  # [B]
-        seeds:        torch.Tensor,  # [B]
-    ) -> torch.Tensor:               # [B, K]
+        seq_ids:   list[str],
+        positions: torch.Tensor,   # [B] — positions of the newly appended token
+    ) -> torch.Tensor:             # [B, K]
         from vllm.forward_context import set_forward_context
+        from vllm.v1.attention.backend import CommonAttentionMetadata
 
-        B = len(seq_ids)
-        K = self.num_speculative_tokens
+        B  = len(seq_ids)
+        K  = self.num_speculative_tokens
         bs = self.block_size
 
-        seq_lens  = torch.tensor(
+        # ── sequence metadata ─────────────────────────────────────────────────
+        # After handle_decode, seq_lengths already include the new token.
+        context_lens = torch.tensor(
             [self.seq_lengths[sid] for sid in seq_ids],
             dtype=torch.int32, device=self.device,
         )
-        max_seq_len = int(seq_lens.max().item())
-        max_blocks  = (max_seq_len + bs - 1) // bs
+        max_ctx = int(context_lens.max().item())
+        max_blk = (max_ctx + bs - 1) // bs
 
-        block_tables = self._build_block_table_tensor(seq_ids, max_blocks)
+        block_tables = self._build_block_table_tensor(seq_ids, max_blk)
 
-        # Query layout per request: (bonus + K mask) tokens
+        # ── query layout: [bonus_token, mask_1, …, mask_K] per request ───────
         num_query_per_req = 1 + K
         num_query_total   = B * num_query_per_req
 
-        # Input IDs: bonus position uses the hidden state already stored;
-        # mask tokens use the model's mask_token_id
         mask_token_id = self._get_mask_token_id()
         input_ids = torch.full(
             (num_query_total,), mask_token_id,
             dtype=torch.int32, device=self.device,
         )
-        # The bonus slot for each request is the first of the num_query_per_req
-        # We leave it as mask_token_id; precompute_and_store_context_kv already
-        # handled writing the bonus KV
 
-        # Positions for query tokens
+        # Positions: newly-appended token is at (context_lens[i] - 1),
+        # query tokens at context_lens[i] - 1 + j for j in [0, num_query_per_req).
         query_positions = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i in range(B):
-            base_pos = int(positions[i].item())  # position of the new token
+            base = int(positions[i].item())
             for j in range(num_query_per_req):
-                query_positions[i * num_query_per_req + j] = base_pos + j
+                query_positions[i * num_query_per_req + j] = base + j
 
-        # Slot mapping for query tokens (write their KV into the cache)
-        query_slots = torch.full(
-            (num_query_total,), -1, dtype=torch.int64, device=self.device
-        )
+        # Slot mapping for query tokens (allocate fresh slots).
+        query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
             blocks = self.seq_block_tables[seq_id]
-            T = self.seq_lengths[seq_id]
+            T      = self.seq_lengths[seq_id]
             for j in range(num_query_per_req):
-                slot = self._slot_for_position(blocks, T - 1 + j)
-                query_slots[i * num_query_per_req + j] = slot
+                pos = T + j  # slots for query tokens after the context
+                while pos >= len(blocks) * bs:
+                    blocks.append(self.block_manager.allocate_one())
+                query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
 
-        # query_start_loc: [B+1]
-        query_start_loc = torch.arange(B + 1, dtype=torch.int32, device=self.device) \
-                          * num_query_per_req
-
-        attn_metadata = self._build_attn_metadata(
-            seq_lens=seq_lens,
-            block_tables=block_tables,
-            query_start_loc=query_start_loc,
-            slot_mapping=query_slots,
-            num_query_total=num_query_total,
-            num_query_per_req=num_query_per_req,
-            max_seq_len=max_seq_len,
+        # query_start_loc [B+1]
+        query_start_loc = (
+            torch.arange(B + 1, dtype=torch.int32, device=self.device)
+            * num_query_per_req
         )
-        if attn_metadata is None:
-            # Fallback: return zeros (will be wrong, but won't crash)
+
+        # ── CommonAttentionMetadata ───────────────────────────────────────────
+        # DFlash2 cross-attention: seq_lens = context + query (full KV window).
+        cad_seq_lens = context_lens + num_query_per_req
+
+        cad = CommonAttentionMetadata(
+            query_start_loc       = query_start_loc,
+            seq_lens              = cad_seq_lens,
+            query_start_loc_cpu   = query_start_loc.cpu(),
+            seq_lens_cpu_upper_bound = int(cad_seq_lens.max().item()),
+            num_reqs              = B,
+            num_actual_tokens     = num_query_total,
+            max_query_len         = num_query_per_req,
+            max_seq_len           = int(cad_seq_lens.max().item()),
+            block_table_tensor    = block_tables,
+            slot_mapping          = query_slots,
+            causal                = not self.requires_non_causal,
+        )
+
+        # ── per-layer FlashInfer metadata from attn_groups ────────────────────
+        per_layer_meta: dict = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                try:
+                    meta = group.get_metadata_builder().build_for_drafting(
+                        common_attn_metadata=cad, draft_index=0
+                    )
+                    for ln in group.layer_names:
+                        per_layer_meta[ln] = meta
+                except Exception as exc:
+                    logger.warning("build_for_drafting failed: %s", exc)
+
+        if not per_layer_meta:
+            logger.warning("No attention metadata built; returning zeros")
             return torch.zeros(B, K, dtype=torch.int32, device=self.device)
 
-        # Build per-layer attn metadata dict
-        per_layer_meta = {}
-        for name, module in self.model.named_modules():
-            if hasattr(module, "attn_layer_name"):
-                per_layer_meta[module.attn_layer_name] = attn_metadata
-
-        # If we couldn't build per-layer map via attn_layer_name, try layer names
-        if not per_layer_meta:
-            for name, module in self.model.named_modules():
-                if "attn" in name and hasattr(module, "forward"):
-                    per_layer_meta[name] = attn_metadata
-
+        # ── model forward ─────────────────────────────────────────────────────
         with set_forward_context(
             per_layer_meta,
             self.vllm_config,
@@ -468,53 +506,44 @@ class DraftModelRunner:
                 positions=query_positions,
             )
 
-        # logits: [num_query_total, vocab_size] or [B, K, vocab_size]
-        # DFlash returns logits for mask positions only; shape [B*K, vocab]
-        # The sample indices are the mask positions (skip the bonus slot)
-        sample_indices = torch.tensor(
+        # logits: [num_query_total, vocab] or similar
+        # Sample from mask positions (skip the bonus slot at each group start).
+        sample_idx = torch.tensor(
             [i * num_query_per_req + 1 + k for i in range(B) for k in range(K)],
             dtype=torch.int64, device=self.device,
         )
-        if logits.dim() == 2:
-            sampled_logits = logits[sample_indices]  # [B*K, vocab]
-        else:
-            sampled_logits = logits.view(-1, logits.shape[-1])[sample_indices]
-
-        # Greedy sample (temperature handled by main verifier)
-        draft_tokens = sampled_logits.argmax(dim=-1).int().view(B, K)
+        flat_logits = (
+            logits if logits.dim() == 2
+            else logits.view(-1, logits.shape[-1])
+        )
+        draft_tokens = flat_logits[sample_idx].argmax(dim=-1).int().view(B, K)
         return draft_tokens
 
-    def _build_attn_metadata(
-        self,
-        seq_lens:         torch.Tensor,  # [B]
-        block_tables:     torch.Tensor,  # [B, max_blocks]
-        query_start_loc:  torch.Tensor,  # [B+1]
-        slot_mapping:     torch.Tensor,  # [num_query_total]
-        num_query_total:  int,
-        num_query_per_req: int,
-        max_seq_len:      int,
-    ):
-        """Try to build FlashAttentionMetadata; return None on import error."""
-        try:
-            from vllm.v1.attention.backends.flash_attn import (
-                FlashAttentionMetadata,
-            )
-        except ImportError:
-            logger.warning("FlashAttentionMetadata not available; skipping forward.")
-            return None
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────────────
 
-        return FlashAttentionMetadata(
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
-            block_tables=block_tables,
-            slot_mapping=slot_mapping,
-            num_actual_tokens=num_query_total,
-            max_query_len=num_query_per_req,
-            max_seq_len=max_seq_len,
-        )
+    def _compute_slot_mapping_for_sequence(
+        self, blocks: list[int], num_tokens: int
+    ) -> torch.Tensor:
+        slots = [self._slot_for_position(blocks, i) for i in range(num_tokens)]
+        return torch.tensor(slots, dtype=torch.int64, device=self.device)
+
+    def _slot_for_position(self, blocks: list[int], pos: int) -> int:
+        return blocks[pos // self.block_size] * self.block_size + pos % self.block_size
+
+    def _build_block_table_tensor(
+        self, seq_ids: list[str], max_blocks: int
+    ) -> torch.Tensor:
+        B  = len(seq_ids)
+        bt = torch.zeros(B, max_blocks, dtype=torch.int32, device=self.device)
+        for i, seq_id in enumerate(seq_ids):
+            blks = self.seq_block_tables[seq_id]
+            bt[i, : len(blks)] = torch.tensor(blks, dtype=torch.int32, device=self.device)
+        return bt
 
     def _get_mask_token_id(self) -> int:
-        hf_config = self.draft_model_config.hf_config
+        hf_config    = self.draft_model_config.hf_config
         dflash_config = getattr(hf_config, "dflash_config", None) or {}
         if "mask_token_id" in dflash_config:
             return dflash_config["mask_token_id"]
@@ -526,7 +555,7 @@ class DraftModelRunner:
 # ── ZMQ server loop ────────────────────────────────────────────────────────────
 
 def run_server(runner: DraftModelRunner, address: str) -> None:
-    ctx = zmq.Context()
+    ctx  = zmq.Context()
     sock = ctx.socket(zmq.ROUTER)
     sock.bind(address)
     logger.info("Draft server listening on %s", address)
@@ -547,14 +576,15 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
             time.sleep(0.0005)
             continue
 
-        # ROUTER frame layout: [identity, empty, header_frame, payload_frame]
-        if len(parts) < 4:
+        if len(parts) < 3:
             continue
-        identity, _, header_frame, payload_frame = parts[0], parts[1], parts[2], parts[3]
+        identity     = parts[0]
+        header_frame = parts[2] if len(parts) >= 4 else parts[1]
+        payload_frame = parts[3] if len(parts) >= 4 else parts[2]
 
         try:
             header = parse_header(header_frame)
-            t = header["t"]
+            t      = header["t"]
 
             if t == MSG_PING:
                 resp_h, resp_p = build_ack()
@@ -590,17 +620,14 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DFlash2 disaggregated draft server")
-    parser.add_argument("--device",   type=int,  default=1,
-                        help="CUDA device index (default: 1)")
-    parser.add_argument("--address",  type=str,  default="tcp://0.0.0.0:50052",
-                        help="ZMQ ROUTER bind address")
-    parser.add_argument("--config-json", type=str, required=True,
-                        help="Path to JSON file containing serialised VllmConfig fields")
+    parser = argparse.ArgumentParser(description="DFlash2 disaggregated draft server v2")
+    parser.add_argument("--device",     type=int, default=1)
+    parser.add_argument("--address",    type=str, default="tcp://0.0.0.0:50052")
+    parser.add_argument("--config-json", type=str, required=True)
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
-    device = torch.device("cuda:0")  # after remapping, device 0 is our GPU
+    device = torch.device("cuda:0")
 
     with open(args.config_json) as f:
         config_dict = json.load(f)
