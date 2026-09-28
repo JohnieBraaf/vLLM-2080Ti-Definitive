@@ -420,12 +420,13 @@ class DraftModelRunner:
         positions:     torch.Tensor,  # [B]
         temperatures:  torch.Tensor,  # [B]
         seeds:         torch.Tensor,  # [B]
+        bonus_ids:     torch.Tensor,  # [B] int32 — actual token IDs for j=0
     ) -> torch.Tensor:                # [B, K]
         B = len(seq_ids)
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         positions     = positions.to(device=self.device)
 
-        # Extend each sequence with the newly generated token's KV.
+        # Extend each sequence with the newly generated token’s KV.
         for i, seq_id in enumerate(seq_ids):
             T_old = self.seq_lengths[seq_id]
             T_new = T_old + 1
@@ -440,7 +441,7 @@ class DraftModelRunner:
             self.model.precompute_and_store_context_kv(hs_i, pos_i, slot_i)
             self.seq_lengths[seq_id] = T_new
 
-        return self._run_draft_forward(seq_ids, positions)
+        return self._run_draft_forward(seq_ids, positions, bonus_ids)
 
     def handle_free(self, seq_id: str) -> None:
         blocks = self.seq_block_tables.pop(seq_id, [])
@@ -456,6 +457,7 @@ class DraftModelRunner:
         self,
         seq_ids:   list[str],
         positions: torch.Tensor,   # [B] — positions of the newly appended token
+        bonus_ids: torch.Tensor,   # [B] int32 — actual token IDs for bonus (j=0)
     ) -> torch.Tensor:             # [B, K]
         from vllm.forward_context import set_forward_context
         from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -480,6 +482,13 @@ class DraftModelRunner:
             (num_query_total,), mask_token_id,
             dtype=torch.int32, device=self.device,
         )
+        # Override j=0 (bonus position) with the actual next-token ID.
+        # In co-located DFlash2, j=0 uses next_token_id not mask_token_id.
+        # With mask_token_id at j=0 the forward pass writes wrong K/V to the
+        # bonus slot (T_old), corrupting all mask-token attention.
+        _bids = bonus_ids.to(device=self.device, dtype=torch.int32)
+        for _i in range(B):
+            input_ids[_i * num_query_per_req] = int(_bids[_i].item())
 
         # Positions: newly-appended token is at (context_lens[i] - 1),
         # query tokens at context_lens[i] - 1 + j for j in [0, num_query_per_req).
@@ -648,9 +657,9 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
                 resp_h, resp_p = build_ack()
 
             elif t == MSG_DECODE:
-                hs, pos, temps, sds = parse_decode_payload(header, payload_frame)
+                hs, pos, temps, sds, bonus_ids = parse_decode_payload(header, payload_frame)
                 draft_tokens = runner.handle_decode(
-                    header["seq_ids"], hs, pos, temps, sds
+                    header["seq_ids"], hs, pos, temps, sds, bonus_ids
                 )
                 resp_h, resp_p = build_draft_response(draft_tokens)
 

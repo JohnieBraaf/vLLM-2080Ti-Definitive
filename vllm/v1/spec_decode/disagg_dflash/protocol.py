@@ -74,6 +74,7 @@ def build_decode(
     positions: torch.Tensor,        # [B] int64
     temperatures: torch.Tensor,     # [B] float32
     seeds: torch.Tensor,            # [B] int64
+    bonus_token_ids: torch.Tensor,  # [B] int32 — actual token IDs for bonus (j=0)
 ) -> tuple[bytes, bytes]:
     B, H = hidden_states.shape
     header = {
@@ -86,7 +87,8 @@ def build_decode(
         pack_tensor(hidden_states.cpu().to(torch.float16)) +
         pack_tensor(positions.cpu().to(torch.int64)) +
         pack_tensor(temperatures.cpu().to(torch.float32)) +
-        pack_tensor(seeds.cpu().to(torch.int64))
+        pack_tensor(seeds.cpu().to(torch.int64)) +
+        pack_tensor(bonus_token_ids.cpu().to(torch.int32))
     )
     return msgpack.packb(header), payload
 
@@ -139,15 +141,17 @@ def parse_prefill_payload(
 
 def parse_decode_payload(
     header: dict, payload: bytes
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, H = header["B"], header["H"]
     hs_bytes    = B * H * 2   # float16
     pos_bytes   = B * 8       # int64
     temp_bytes  = B * 4       # float32
     seed_bytes  = B * 8       # int64
+    bonus_bytes = B * 4       # int32
     o = 0
     hidden_states = unpack_tensor(payload[o:o+hs_bytes],   torch.float16, (B, H)); o += hs_bytes
     positions     = unpack_tensor(payload[o:o+pos_bytes],  torch.int64,   (B,));   o += pos_bytes
     temperatures  = unpack_tensor(payload[o:o+temp_bytes], torch.float32, (B,));   o += temp_bytes
-    seeds         = unpack_tensor(payload[o:o+seed_bytes], torch.int64,   (B,))
-    return hidden_states, positions, temperatures, seeds
+    seeds         = unpack_tensor(payload[o:o+seed_bytes], torch.int64,   (B,));   o += seed_bytes
+    bonus_ids     = unpack_tensor(payload[o:o+bonus_bytes],torch.int32,   (B,))
+    return hidden_states, positions, temperatures, seeds, bonus_ids
