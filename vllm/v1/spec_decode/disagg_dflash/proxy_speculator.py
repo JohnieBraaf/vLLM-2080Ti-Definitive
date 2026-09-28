@@ -101,7 +101,16 @@ class DisaggDFlashProposer(BaseSpeculator):
             logger.info(
                 "DisaggDFlashProposer connected to draft server at %s", self.address
             )
-            self._ping_server()
+            # Ping is best-effort — draft server may still be warming up its
+            # FlashInfer kernels.  Failures here are non-fatal; real requests
+            # will retry via the try/except in _do_propose.
+            try:
+                self._ping_server()
+            except Exception as exc:
+                logger.warning(
+                    "Draft server not ready at startup (warmup in progress?): %s. "
+                    "Requests will retry automatically.", exc
+                )
         else:
             self._zmq_ctx = None
             self._sock    = None
