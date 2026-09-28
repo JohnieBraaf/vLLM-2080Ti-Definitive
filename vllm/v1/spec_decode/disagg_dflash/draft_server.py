@@ -93,6 +93,8 @@ class DraftModelRunner:
         self.seq_block_tables: dict[str, list[int]] = {}
         self.seq_lengths:      dict[str, int]       = {}
 
+        self._warmup_kernels()
+
         logger.info(
             "DraftModelRunner ready on %s: %d KV blocks (block_size=%d)",
             device, self.num_blocks, self.block_size,
@@ -347,6 +349,32 @@ class DraftModelRunner:
 
     def _init_block_manager(self) -> None:
         self.block_manager = SimpleBlockManager(self.num_blocks, self.block_size)
+
+    def _warmup_kernels(self) -> None:
+        """Pre-compile FlashInfer JIT kernels via a dummy forward pass.
+
+        On SM75 (RTX 2080 Ti) first-time compilation is 60-120 s.  Running this
+        during startup ensures actual requests hit the kernel cache.
+        """
+        logger.info("Warming up FlashInfer kernels (may take a few minutes on SM75)…")
+        seq_id = "__warmup__"
+        try:
+            H        = self.draft_model_config.get_hidden_size()
+            dummy_T  = self.block_size          # one full block of context
+            dummy_hs = torch.zeros(dummy_T, H, dtype=self.dtype, device=self.device)
+            dummy_pos = torch.arange(dummy_T,  dtype=torch.int64, device=self.device)
+            self.handle_prefill(seq_id, dummy_hs, dummy_pos)
+
+            dummy_new   = torch.zeros(1, H, dtype=self.dtype, device=self.device)
+            dummy_pos_n = torch.tensor([dummy_T], dtype=torch.int64, device=self.device)
+            dummy_temps = torch.ones(1,  dtype=torch.float32, device=self.device)
+            dummy_seeds = torch.zeros(1, dtype=torch.int64,   device=self.device)
+            self.handle_decode([seq_id], dummy_new, dummy_pos_n, dummy_temps, dummy_seeds)
+            logger.info("FlashInfer warmup complete.")
+        except Exception as exc:
+            logger.warning("Warmup failed (non-fatal): %s", exc)
+        finally:
+            self.handle_free(seq_id)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Request handlers
