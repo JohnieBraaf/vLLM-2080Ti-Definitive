@@ -86,7 +86,6 @@ class DraftModelRunner:
         torch.cuda.set_device(device)
 
         self._build_vllm_config(vllm_config_dict)
-        self._init_distributed()
         self._load_model()
         self._init_kv_cache()
         self._init_block_manager()
