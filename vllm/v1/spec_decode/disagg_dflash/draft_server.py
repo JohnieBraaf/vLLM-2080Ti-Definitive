@@ -542,7 +542,7 @@ class DraftModelRunner:
 
         # ── CommonAttentionMetadata ───────────────────────────────────────────
         # DFlash2 cross-attention: seq_lens = context + query (full KV window).
-        cad_seq_lens = context_lens + num_query_per_req
+        cad_seq_lens = context_lens + num_query_per_req - 1
 
         cad = CommonAttentionMetadata(
             query_start_loc       = query_start_loc,
