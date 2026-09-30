@@ -370,13 +370,18 @@ class DraftModelRunner:
             dummy_T  = self.block_size          # one full block of context
             dummy_hs = torch.zeros(dummy_T, H, dtype=self.dtype, device=self.device)
             dummy_pos = torch.arange(dummy_T,  dtype=torch.int64, device=self.device)
+            logger.info("Warmup: running handle_prefill (precompute_and_store_context_kv)…")
             self.handle_prefill(seq_id, dummy_hs, dummy_pos)
+            torch.cuda.synchronize(self.device)
+            logger.info("Warmup: handle_prefill OK")
 
             dummy_new   = torch.zeros(1, H, dtype=self.dtype, device=self.device)
             dummy_pos_n = torch.tensor([dummy_T], dtype=torch.int64, device=self.device)
             dummy_temps = torch.ones(1,  dtype=torch.float32, device=self.device)
             dummy_seeds = torch.zeros(1, dtype=torch.int64,   device=self.device)
+            logger.info("Warmup: running handle_decode (model forward pass)…")
             self.handle_decode([seq_id], dummy_new, dummy_pos_n, dummy_temps, dummy_seeds)
+            torch.cuda.synchronize(self.device)
             logger.info("FlashInfer warmup complete.")
         except Exception as exc:
             logger.warning("Warmup failed (non-fatal): %s", exc)
