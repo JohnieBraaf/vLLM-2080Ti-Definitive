@@ -875,20 +875,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # managers in every group. TP needs hashing finer than the Mamba block;
         # DCP accepts equality because it scales the effective full-attention
         # block instead.
-        has_partial_mamba_group = any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.supports_fine_grained_prefix_cache
+        mamba_specs = [
+            g.kv_cache_spec
+            for g in kv_cache_config.kv_cache_groups
+            if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        has_partial_mamba_group = bool(mamba_specs) and all(
+            spec.mamba_cache_mode == "align"
+            and spec.supports_fine_grained_prefix_cache
             and (
                 # Keep partial-hash alignment when the Mamba block is exactly
                 # the hash unit too.  This is required when the scheduler's
                 # chunk budget is larger than both hybrid group blocks.
-                (dcp_world_size == 1 and g.kv_cache_spec.block_size >= hash_block_size)
+                (dcp_world_size == 1 and spec.block_size >= hash_block_size)
                 or (
-                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
+                    dcp_world_size > 1 and spec.block_size >= hash_block_size
                 )
             )
-            for g in kv_cache_config.kv_cache_groups
+            for spec in mamba_specs
         )
         self.enable_partial_hash_hits = (
             allow_partial_hash_hits and has_partial_mamba_group
