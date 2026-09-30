@@ -452,7 +452,7 @@ class DraftModelRunner:
             new_slot = self._slot_for_position(blocks, T_old)
             hs_i     = hidden_states[i].unsqueeze(0)
             pos_i    = positions[i].unsqueeze(0)
-            slot_i   = torch.tensor([new_slot], device=self.device, dtype=torch.int32)
+            slot_i   = torch.tensor([new_slot], device=self.device, dtype=torch.int64)
             self.model.precompute_and_store_context_kv(hs_i, pos_i, slot_i)
             self.seq_lengths[seq_id] = T_new
 
@@ -518,7 +518,7 @@ class DraftModelRunner:
         # Allocate query slots. Save the pre-query block count per sequence so
         # we can release the temporary query blocks after the forward pass.
         pre_query_counts: list[int] = []
-        query_slots = torch.zeros(num_query_total, dtype=torch.int32, device=self.device)
+        query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
             blocks   = self.seq_block_tables[seq_id]
             pre_query_counts.append(len(blocks))   # save BEFORE extending
@@ -616,7 +616,7 @@ class DraftModelRunner:
         self, blocks: list[int], num_tokens: int
     ) -> torch.Tensor:
         slots = [self._slot_for_position(blocks, i) for i in range(num_tokens)]
-        return torch.tensor(slots, dtype=torch.int32, device=self.device)
+        return torch.tensor(slots, dtype=torch.int64, device=self.device)
 
     def _slot_for_position(self, blocks: list[int], pos: int) -> int:
         return blocks[pos // self.block_size] * self.block_size + pos % self.block_size
