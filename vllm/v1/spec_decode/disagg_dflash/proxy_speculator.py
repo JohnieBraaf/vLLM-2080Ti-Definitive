@@ -35,7 +35,9 @@ from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 
 logger = init_logger(__name__)
 
-_TIMEOUT_MS = 10_000  # 10 s per request
+import os
+
+_TIMEOUT_MS = int(os.environ.get("VLLM_DISAGG_DRAFT_ZMQ_TIMEOUT_MS", "10000"))
 
 
 class DisaggDFlashProposer(BaseSpeculator):

@@ -81,8 +81,11 @@ class DraftModelRunner:
       - bind_kv_cache_to_layers() to bind KV into attention layers
     """
 
-    def __init__(self, vllm_config_dict: dict, device: torch.device):
+    def __init__(self, vllm_config_dict: dict, device: torch.device,
+                 *, dist_master_port: int = 29600, kv_headroom_gb: float = 1.0):
         self.device = device
+        self.dist_master_port = dist_master_port
+        self.kv_headroom_bytes = int(kv_headroom_gb * 1024 ** 3)
         torch.cuda.set_device(device)
 
         self._build_vllm_config(vllm_config_dict)
@@ -125,7 +128,7 @@ class DraftModelRunner:
         )
 
         os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12356")
+        os.environ.setdefault("MASTER_PORT", str(self.dist_master_port))
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         if not dist.is_initialized():
@@ -215,7 +218,7 @@ class DraftModelRunner:
             initialize_model_parallel,
         )
         os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12356")
+        os.environ.setdefault("MASTER_PORT", str(self.dist_master_port))
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         if not dist.is_initialized():
@@ -289,7 +292,7 @@ class DraftModelRunner:
         # ── Step 2: compute num_blocks from free memory ───────────────────────
         torch.cuda.synchronize(self.device)
         free_bytes, _ = torch.cuda.mem_get_info(self.device.index)
-        usable_bytes  = max(0, free_bytes - 1 * 1024 ** 3)  # 1 GB overhead
+        usable_bytes  = max(0, free_bytes - self.kv_headroom_bytes)
 
         # k + v, float16 (2 bytes), [num_kv_heads, block_size, head_size]
         block_page_bytes = 2 * num_kv_heads * bs * head_size * 2
@@ -694,19 +697,31 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DFlash2 disaggregated draft server v2")
-    parser.add_argument("--device",     type=int, default=1)
-    parser.add_argument("--address",    type=str, default="tcp://0.0.0.0:50052")
-    parser.add_argument("--config-json", type=str, required=True)
+    parser = argparse.ArgumentParser(description="DFlash2 disaggregated draft server")
+    parser.add_argument("--device", type=int, default=None,
+        help="CUDA device ordinal to use. Sets CUDA_VISIBLE_DEVICES if not already "
+             "set in the environment. When CUDA_VISIBLE_DEVICES is already set this "
+             "argument is ignored.")
+    parser.add_argument("--address", type=str, default="tcp://0.0.0.0:50052",
+        help="ZMQ ROUTER bind address (default: tcp://0.0.0.0:50052).")
+    parser.add_argument("--config-json", type=str, required=True,
+        help="Path to JSON config produced by DisaggDFlashProposer.write_draft_config.")
+    parser.add_argument("--dist-master-port", type=int, default=29600,
+        help="TCP port for the single-rank gloo process group (default: 29600).")
+    parser.add_argument("--kv-headroom-gb", type=float, default=1.0,
+        help="GPU memory (GiB) to reserve beyond the KV cache (default: 1.0).")
     args = parser.parse_args()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
+    if args.device is not None:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.device))
     device = torch.device("cuda:0")
 
     with open(args.config_json) as f:
         config_dict = json.load(f)
 
-    runner = DraftModelRunner(config_dict, device)
+    runner = DraftModelRunner(config_dict, device,
+                              dist_master_port=args.dist_master_port,
+                              kv_headroom_gb=args.kv_headroom_gb)
     run_server(runner, args.address)
 
 
