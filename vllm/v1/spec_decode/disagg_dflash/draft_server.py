@@ -379,8 +379,9 @@ class DraftModelRunner:
             dummy_pos_n = torch.tensor([dummy_T], dtype=torch.int64, device=self.device)
             dummy_temps = torch.ones(1,  dtype=torch.float32, device=self.device)
             dummy_seeds = torch.zeros(1, dtype=torch.int64,   device=self.device)
+            dummy_bonus = torch.zeros(1, dtype=torch.int32,   device=self.device)
             logger.info("Warmup: running handle_decode (model forward pass)…")
-            self.handle_decode([seq_id], dummy_new, dummy_pos_n, dummy_temps, dummy_seeds)
+            self.handle_decode([seq_id], dummy_new, dummy_pos_n, dummy_temps, dummy_seeds, dummy_bonus)
             torch.cuda.synchronize(self.device)
             logger.info("FlashInfer warmup complete.")
         except Exception as exc:
