@@ -21,12 +21,13 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
-def _mamba_align(block_size=32):
+def _mamba_align(block_size=32, *, supports_fine_grained_prefix_cache=True):
     return MambaSpec(
         block_size=block_size,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
+        supports_fine_grained_prefix_cache=supports_fine_grained_prefix_cache,
     )
 
 
@@ -247,6 +248,44 @@ def test_coordinator_fine_grained_clips_when_one_group_missing_tail():
     cmap = ExternalCachedBlockPool(16, exists)
     _masks, hit = coord.find_longest_cache_hit(
         hs, max_length=64, cached_block_pool=cmap
+    )
+    assert hit == 32
+
+
+def test_coordinator_gdn_capability_disables_sub_block_hit():
+    groups = [
+        KVCacheGroupSpec(["L0"], _full(32)),
+        KVCacheGroupSpec(
+            ["L1"], _mamba_align(32, supports_fine_grained_prefix_cache=False)
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=16)
+    assert not coord.enable_partial_hash_hits
+    assert coord.align_lookup_length(48) == 32
+
+    hs = _hashes(4)
+    exists = {(g, bytes(h)) for g in (0, 1) for h in (hs[1], hs[2])}
+    _, hit = coord.find_longest_cache_hit(
+        hs, max_length=64, cached_block_pool=ExternalCachedBlockPool(16, exists)
+    )
+    assert hit == 32
+
+
+def test_coordinator_mixed_mamba_capabilities_disable_sub_block_hit():
+    groups = [
+        KVCacheGroupSpec(["L0"], _full(32)),
+        KVCacheGroupSpec(["L1"], _mamba_align(32)),
+        KVCacheGroupSpec(
+            ["L2"], _mamba_align(32, supports_fine_grained_prefix_cache=False)
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=16)
+    assert not coord.enable_partial_hash_hits
+
+    hs = _hashes(4)
+    exists = {(g, bytes(h)) for g in range(3) for h in (hs[1], hs[2])}
+    _, hit = coord.find_longest_cache_hit(
+        hs, max_length=64, cached_block_pool=ExternalCachedBlockPool(16, exists)
     )
     assert hit == 32
 
