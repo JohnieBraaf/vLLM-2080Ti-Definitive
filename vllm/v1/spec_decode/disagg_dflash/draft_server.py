@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# slot tensors use int64 (Long) throughout — FlashInfer do_kv_cache_update requires Long.
 """Standalone draft server for disaggregated DFlash2 speculative decoding.
 
 v2: uses vLLM's proper KV cache infrastructure (init_attn_backend,
