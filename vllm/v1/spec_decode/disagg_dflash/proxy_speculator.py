@@ -200,8 +200,10 @@ class DisaggDFlashProposer(BaseSpeculator):
             _qsl = getattr(input_batch, "query_start_loc", None)
         qsl = _qsl
 
+        new_in_this_call: set[int] = set()
         for i, seq_id in enumerate(req_ids):
             if seq_id not in self._active_seqs:   # new sequence
+                new_in_this_call.add(i)
                 tok_start = int(qsl[i])
                 tok_end   = int(qsl[i + 1])
                 hs_seq    = last_hidden_states[tok_start:tok_end].cpu()
@@ -220,6 +222,8 @@ class DisaggDFlashProposer(BaseSpeculator):
         decode_seeds = seeds[:num_reqs].cpu()
 
         for i in range(num_reqs):
+            if i in new_in_this_call:
+                continue  # skip DECODE for newly-prefilled seqs — context not ready
             tok_end = int(qsl[i + 1]) - 1
             decode_hs[i]  = last_hidden_states[tok_end].cpu().to(torch.float16)
             decode_pos[i] = int(input_batch.seq_lens_cpu_upper_bound[i]) - 1
