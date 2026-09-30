@@ -604,6 +604,11 @@ class DFlashQwen3Model(nn.Module):
             )
             self._build_fused_kv_buffers()
 
+        if not hasattr(self, "_sm75_kv_write"):
+            import torch
+            cap = torch.cuda.get_device_capability(context_states.device)
+            self._sm75_kv_write = cap[0] < 8  # SM75 (7.5) — FlashInfer kv-write kernel causes Xid 13
+
         num_ctx = context_states.shape[0]
         L = self._num_attn_layers
         kv = self._kv_size
@@ -644,13 +649,23 @@ class DFlashQwen3Model(nn.Module):
                 continue  # dummy run: skip cache ops
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
-            attn.impl.do_kv_cache_update(
-                attn,
-                all_k_final[i],
-                all_v[i],
-                kv_cache,
-                slot_mapping,
-            )
+            if self._sm75_kv_write:
+                # SM75: FlashInfer do_kv_cache_update causes Xid 13 (out-of-range addr).
+                # Use direct PyTorch advanced indexing instead.
+                # kv_cache layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+                _bs = kv_cache.shape[2]
+                _pi = (slot_mapping // _bs).long()
+                _po = (slot_mapping % _bs).long()
+                kv_cache[_pi, 0, _po] = all_k_final[i]
+                kv_cache[_pi, 1, _po] = all_v[i]
+            else:
+                attn.impl.do_kv_cache_update(
+                    attn,
+                    all_k_final[i],
+                    all_v[i],
+                    kv_cache,
+                    slot_mapping,
+                )
 
     def forward(
         self,
