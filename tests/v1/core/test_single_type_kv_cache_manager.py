@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -142,6 +143,38 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
     block_pool.touch((pinned_block,))
     with pytest.raises(AssertionError, match="exclusively owned and unhashed"):
         manager._relocate_speculative_block([pinned_block], 0)
+
+
+def test_mamba_checkpoint_requires_backend_exporter():
+    """A reservation alone must not publish an unwritten Mamba state page."""
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=16,
+    )
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+
+    assert not manager.has_prefill_checkpoint_blocks
+
+    exporter_spec = replace(spec, supports_prefill_checkpoint=True)
+    exporter_manager = MambaManager(
+        exporter_spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+    assert exporter_manager.has_prefill_checkpoint_blocks
 
 
 def test_mamba_retirement_crosses_null_gaps():

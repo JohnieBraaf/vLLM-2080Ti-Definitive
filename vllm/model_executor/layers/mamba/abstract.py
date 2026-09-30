@@ -83,6 +83,9 @@ class MambaBase(AttentionLayerBase):
                 if vllm_config.cache_config.use_kda_recoverssm
                 else vllm_config.num_speculative_tokens
             ),
+            # Concrete backends with an internal checkpoint exporter must opt
+            # in when extending this spec (for example KDA/FlashKDA).
+            supports_prefill_checkpoint=False,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

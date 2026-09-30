@@ -1462,6 +1462,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.has_prefill_checkpoint_blocks = (
             self.mamba_cache_mode == "align"
+            and kv_cache_spec.supports_prefill_checkpoint
             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
         )
         # Mamba checkpoints follow Eagle's global replay boundary.
