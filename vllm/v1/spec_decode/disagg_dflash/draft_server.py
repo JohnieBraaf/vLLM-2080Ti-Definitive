@@ -410,7 +410,7 @@ class DraftModelRunner:
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         positions     = positions.to(device=self.device)
 
-        blocks       = self.block_manager.allocate(-(-T // self.block_size))
+        blocks       = self.block_manager.allocate(T)
         self.seq_block_tables[seq_id] = blocks
         self.seq_lengths[seq_id]      = T
 
