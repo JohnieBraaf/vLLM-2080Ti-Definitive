@@ -1004,9 +1004,10 @@ class MambaSpec(KVCacheSpec):
     # currently implement that exporter; KDA/FlashKDA opts in explicitly.
     supports_prefill_checkpoint: bool = False
     # Fine-grained prefix hits require the backend to materialize a valid
-    # recurrent state at a sub-block boundary. Backends that only export the
-    # ordinary block-end state must opt in explicitly.
-    supports_fine_grained_prefix_cache: bool = False
+    # recurrent state at a sub-block boundary. Keep direct legacy spec
+    # construction compatible; concrete Mamba backends declare their actual
+    # capability when constructing this spec.
+    supports_fine_grained_prefix_cache: bool = True
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
