@@ -400,6 +400,12 @@ class DraftModelRunner:
         positions:     torch.Tensor,  # [T]
     ) -> None:
         T = hidden_states.shape[0]
+        needed_blocks = -(-T // self.block_size)
+        if needed_blocks > self.num_blocks:
+            raise RuntimeError(
+                f"PREFILL T={T} needs {needed_blocks} blocks but only "
+                f"{self.num_blocks} available — dropping sequence"
+            )
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         positions     = positions.to(device=self.device)
 
