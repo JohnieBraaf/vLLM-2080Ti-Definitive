@@ -641,6 +641,10 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
 
     def _stop(sig, frame):
         nonlocal running
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
         running = False
 
     signal.signal(signal.SIGTERM, _stop)
@@ -692,6 +696,10 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
         sock.send_multipart([identity, b"", resp_h, resp_p])
 
     sock.close()
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
     ctx.destroy()
     logger.info("Draft server stopped.")
 
