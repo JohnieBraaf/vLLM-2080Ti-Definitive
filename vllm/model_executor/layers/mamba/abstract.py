@@ -86,6 +86,7 @@ class MambaBase(AttentionLayerBase):
             # Concrete backends with an internal checkpoint exporter must opt
             # in when extending this spec (for example KDA/FlashKDA).
             supports_prefill_checkpoint=False,
+            supports_fine_grained_prefix_cache=False,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

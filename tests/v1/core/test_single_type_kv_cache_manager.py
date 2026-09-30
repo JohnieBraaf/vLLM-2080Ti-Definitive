@@ -166,6 +166,12 @@ def test_mamba_checkpoint_requires_backend_exporter():
 
     assert not manager.has_prefill_checkpoint_blocks
 
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+    assert spec.max_memory_usage_bytes(config) == 2 * spec.page_size_bytes
+
     exporter_spec = replace(spec, supports_prefill_checkpoint=True)
     exporter_manager = MambaManager(
         exporter_spec,
@@ -175,6 +181,7 @@ def test_mamba_checkpoint_requires_backend_exporter():
         scheduler_block_size=16,
     )
     assert exporter_manager.has_prefill_checkpoint_blocks
+    assert exporter_spec.max_memory_usage_bytes(config) == 3 * spec.page_size_bytes
 
 
 def test_mamba_retirement_crosses_null_gaps():

@@ -111,6 +111,8 @@ def make_full_mamba_manager(
             prefill_checkpoint_alignment=(
                 16 if num_prefill_checkpoint_blocks > 0 else None
             ),
+            supports_prefill_checkpoint=num_prefill_checkpoint_blocks > 0,
+            supports_fine_grained_prefix_cache=True,
         ),
     )
     kv_cache_config = KVCacheConfig(

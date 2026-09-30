@@ -878,6 +878,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         has_partial_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
+            and g.kv_cache_spec.supports_fine_grained_prefix_cache
             and (
                 # Keep partial-hash alignment when the Mamba block is exactly
                 # the hash unit too.  This is required when the scheduler's
