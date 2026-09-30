@@ -402,6 +402,8 @@ class DraftModelRunner:
         positions:     torch.Tensor,  # [T]
     ) -> None:
         T = hidden_states.shape[0]
+        logger.info("PREFILL seq=%s T=%d pos[0]=%d pos[-1]=%d",
+                    seq_id, T, int(positions[0].item()), int(positions[-1].item()))
         needed_blocks = -(-T // self.block_size)
         if needed_blocks > self.num_blocks:
             raise RuntimeError(
