@@ -179,11 +179,6 @@ def _sm75_spec_prefill_graph_query_len(
     kv_cache_spec: KVCacheSpec,
 ) -> int | None:
     """Return the one SM75 speculative query width safe for FULL capture."""
-    if (
-        current_platform.is_device_capability(75)
-        and os.environ.get("VLLM_SM75_SDPA_BYPASS", "0") == "1"
-    ):
-        return None
     speculative_config = vllm_config.speculative_config
     compilation_config = vllm_config.compilation_config
     if (
@@ -1972,11 +1967,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_prefill_tokens
                     == common_attn_metadata.max_query_len * num_prefills
                     and current_platform.is_device_capability(75)
-                    and os.environ.get("VLLM_SM75_SDPA_BYPASS", "0") == "1"
                 ):
-                    prefill_wrapper._sm75_paged_kv_indices = paged_kv_indices
-                    prefill_wrapper._sm75_paged_kv_indptr = paged_kv_indptr_prefill_cpu
-                    prefill_wrapper._sm75_paged_kv_last_page_len = paged_kv_last_page_len_prefill_cpu
+                    prefill_wrapper._sm75_kv_indptr_gpu = self.paged_kv_indptr.gpu[:num_prefills + 1]
+                    prefill_wrapper._sm75_kv_indices_gpu = paged_kv_indices
+                    prefill_wrapper._sm75_kv_last_len_gpu = self.paged_kv_last_page_len.gpu[:num_prefills]
                     attn_metadata.prefill = FIPrefill(
                         wrapper=prefill_wrapper,
                         sm75_page_size=self.page_size,
@@ -2591,15 +2585,17 @@ class FlashInferImpl(AttentionImpl):
                         if (
                             isinstance(attn_metadata.prefill, FIPrefill)
                             and attn_metadata.prefill.sm75_page_size > 0
-                            and hasattr(prefill_wrapper, '_sm75_paged_kv_indices')
+                            and hasattr(prefill_wrapper, '_sm75_kv_indptr_gpu')
                         ):
-                            _sm75_paged_prefill_sdpa(
+                            from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
+                                sm75_blhnc_paged_cross_attn,
+                            )
+                            sm75_blhnc_paged_cross_attn(
                                 prefill_query,
                                 kv_cache,
-                                prefill_wrapper._sm75_paged_kv_indices,
-                                prefill_wrapper._sm75_paged_kv_indptr,
-                                prefill_wrapper._sm75_paged_kv_last_page_len,
-                                attn_metadata.prefill.sm75_page_size,
+                                prefill_wrapper._sm75_kv_indptr_gpu,
+                                prefill_wrapper._sm75_kv_indices_gpu,
+                                prefill_wrapper._sm75_kv_last_len_gpu,
                                 attn_metadata.prefill.sm75_num_reqs,
                                 attn_metadata.prefill.sm75_query_len,
                                 self.scale,
