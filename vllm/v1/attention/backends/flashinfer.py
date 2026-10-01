@@ -165,6 +165,12 @@ def _sm75_spec_prefill_graph_query_len(
     kv_cache_spec: KVCacheSpec,
 ) -> int | None:
     """Return the one SM75 speculative query width safe for FULL capture."""
+    # SM75 spec decode uses the SDPA bypass in eager mode; the CUDA graph path
+    # is disabled because paged KV indices vary in size between the warmup
+    # capture (1 page) and real requests (hundreds of pages), causing the
+    # captured gather to use the wrong context at replay time.
+    if current_platform.is_device_capability(75):
+        return None
     speculative_config = vllm_config.speculative_config
     compilation_config = vllm_config.compilation_config
     if (
@@ -1946,7 +1952,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                if use_sm75_spec_graph_wrapper:
+                if (
+                    paged_kv_indices is not None
+                    and num_prefills > 0
+                    and 1 < common_attn_metadata.max_query_len <= 8
+                    and num_prefill_tokens
+                    == common_attn_metadata.max_query_len * num_prefills
+                    and current_platform.is_device_capability(75)
+                ):
                     prefill_wrapper._sm75_paged_kv_indices = paged_kv_indices
                     prefill_wrapper._sm75_paged_kv_indptr = paged_kv_indptr_prefill_cpu
                     prefill_wrapper._sm75_paged_kv_last_page_len = paged_kv_last_page_len_prefill_cpu
@@ -1954,7 +1967,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         wrapper=prefill_wrapper,
                         sm75_page_size=self.page_size,
                         sm75_num_reqs=num_prefills,
-                        sm75_query_len=self._sm75_spec_query_len,
+                        sm75_query_len=common_attn_metadata.max_query_len,
                     )
                 else:
                     attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
