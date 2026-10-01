@@ -431,10 +431,39 @@ def test_copy_kv_cache_blocks_supports_independent_pool_capacities():
         [target, draft],
         [4, 2],
         [KVCacheBlockCopy(src_block_id=0, dst_block_id=1)],
+        cache_group_ids=[0, 1],
     )
 
     torch.testing.assert_close(target[1], expected_target)
     torch.testing.assert_close(draft[1], expected_draft)
+
+
+def test_copy_kv_cache_blocks_isolates_independent_pools_with_overlapping_ids():
+    target = torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2)
+    draft = torch.arange(2 * 2, dtype=torch.float32).reshape(2, 2) + 100
+    target_source = target[0].clone()
+    draft_source = draft[1].clone()
+
+    copy_kv_cache_blocks_inplace(
+        [target, draft],
+        [4, 2],
+        [KVCacheBlockCopy(0, 1, group_id=0), KVCacheBlockCopy(1, 0, group_id=1)],
+        cache_group_ids=[0, 1],
+    )
+
+    torch.testing.assert_close(target[1], target_source)
+    torch.testing.assert_close(draft[0], draft_source)
+    torch.testing.assert_close(target[0], target_source)
+    torch.testing.assert_close(draft[1], draft_source)
+
+
+def test_grouped_kv_block_copy_requires_cache_group_ids():
+    with pytest.raises(ValueError, match="require cache_group_ids"):
+        copy_kv_cache_blocks_inplace(
+            [torch.zeros((2, 2))],
+            2,
+            [KVCacheBlockCopy(0, 1, group_id=0)],
+        )
 
 
 def test_fixed_block_stride_propagates_outward_in_lhbnc():

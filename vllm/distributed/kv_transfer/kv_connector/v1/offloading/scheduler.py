@@ -1242,11 +1242,14 @@ class OffloadingConnectorScheduler:
                             )
 
         for copy in scheduler_output.kv_cache_block_copies or ():
-            # Block copies do not carry a group ID. Check every namespace.
-            for group_config in self.config.kv_group_configs:
-                self._current_batch_allocated_block_ids.add(
-                    self._fence_key(group_config.group_idx, copy.dst_block_id)
-                )
+            group_id = copy.group_id
+            if self._independent_block_pools:
+                assert group_id is not None
+            else:
+                group_id = 0
+            self._current_batch_allocated_block_ids.add(
+                self._fence_key(group_id, copy.dst_block_id)
+            )
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks

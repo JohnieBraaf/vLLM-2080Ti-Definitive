@@ -241,6 +241,7 @@ class KVCacheBlock:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    group_id: int | None = None
 
 
 class FreeKVCacheBlockQueue:

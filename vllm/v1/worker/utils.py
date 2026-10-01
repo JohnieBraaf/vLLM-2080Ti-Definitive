@@ -719,24 +719,52 @@ def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int | Sequence[int],
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    cache_group_ids: Sequence[int] | None = None,
 ) -> None:
     if not kv_cache_block_copies:
         return
+    has_grouped_copies = any(
+        copy.group_id is not None for copy in kv_cache_block_copies
+    )
+    if cache_group_ids is None and has_grouped_copies:
+        raise ValueError("grouped KV block copies require cache_group_ids")
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
-    copied_storages: set[tuple[torch.device, int]] = set()
+    indices_by_group: dict[int | None, np.ndarray] = {}
+    device_indices: dict[tuple[int | None, torch.device], torch.Tensor] = {}
+    seen: set[tuple[int | None, torch.device, int]] = set()
+    copied_storages: set[tuple[int | None, torch.device, int]] = set()
     for cache_idx, cache in enumerate(kv_caches):
+        group_id = (
+            cache_group_ids[cache_idx]
+            if has_grouped_copies and cache_group_ids is not None
+            else None
+        )
+        if group_id not in indices_by_group:
+            indices_by_group[group_id] = np.asarray(
+                [
+                    (copy.src_block_id, copy.dst_block_id)
+                    for copy in kv_cache_block_copies
+                    if copy.group_id is None or copy.group_id == group_id
+                ],
+                dtype=np.int64,
+            )
+        indices_np = indices_by_group[group_id]
+        if not len(indices_np):
+            continue
+
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
         # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
+        key = (group_id, cache.device, cache.data_ptr())
         if key in seen:
             continue
         seen.add(key)
 
-        if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
+        device_key = (group_id, cache.device)
+        if device_key not in device_indices:
+            device_indices[device_key] = async_tensor_h2d(
+                indices_np, device=cache.device
+            )
+        indices = device_indices[device_key]
         assert cache.device == indices.device
         src, dst = indices.unbind(dim=1)
 
@@ -755,7 +783,7 @@ def copy_kv_cache_blocks_inplace(
             f"{cache_num_blocks} scheduler blocks"
         )
         storage = cache.untyped_storage()
-        storage_key = (cache.device, storage.data_ptr())
+        storage_key = (group_id, cache.device, storage.data_ptr())
         scheduler_block_stride = (
             cache.stride(0) * cache.element_size() * kernel_blocks_per_block
         )

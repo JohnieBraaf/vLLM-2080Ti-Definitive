@@ -1257,6 +1257,7 @@ class GPUModelRunner(
                 self.kv_caches,
                 self.kv_cache_num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_group_ids,
             )
 
         # Free the cached encoder outputs.
@@ -7462,6 +7463,17 @@ class GPUModelRunner(
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
+        cache_layer_names = sorted(
+            kv_caches, key=lambda name: extract_layer_index(name, num_attn_module)
+        )
+        group_id_by_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        self.kv_cache_group_ids = [
+            group_id_by_layer[layer_name] for layer_name in cache_layer_names
+        ]
         self.kv_cache_num_blocks = [
             kv_cache_config.num_blocks_of(
                 next(
@@ -7470,10 +7482,7 @@ class GPUModelRunner(
                     if layer_name in tensor.layers
                 )
             )
-            for layer_name in sorted(
-                kv_caches,
-                key=lambda name: extract_layer_index(name, num_attn_module),
-            )
+            for layer_name in cache_layer_names
         ]
         bind_kv_cache(
             kv_caches,

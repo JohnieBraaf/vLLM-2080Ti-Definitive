@@ -414,6 +414,29 @@ def test_independent_pool_fence_matches_only_its_group():
     assert scheduler.build_connector_meta(output).jobs_to_flush == {job_id}
 
 
+@pytest.mark.parametrize("copy_group_id,should_flush", [(0, False), (1, True)])
+def test_independent_pool_copy_fence_uses_owning_group(copy_group_id, should_flush):
+    scheduler = _make_partial_tail_scheduler(independent_block_pools=True)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    meta = scheduler.build_connector_meta(output)
+    [job_id] = meta.store_jobs
+
+    output = SchedulerOutput.make_empty()
+    output.kv_cache_block_copies = [KVCacheBlockCopy(98, 99, group_id=copy_group_id)]
+    assert scheduler.build_connector_meta(output).jobs_to_flush == (
+        {job_id} if should_flush else set()
+    )
+
+
 def test_independent_eagle_store_keeps_replay_window():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler._independent_block_pools = True
