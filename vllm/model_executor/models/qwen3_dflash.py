@@ -626,8 +626,12 @@ class DFlashQwen3Model(nn.Module):
         cos_sin_cache = self._rope_cos_sin_cache
         if cos_sin_cache.dtype != all_k_flat.dtype:
             cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+        # Guard against out-of-bounds positions (e.g. when decode position equals
+        # the RoPE cache size on SM75 — causes Xid 13 in the rotary kernel).
+        _max_pos = cos_sin_cache.shape[0]
+        positions_for_rope = positions_repeated.clamp(max=_max_pos - 1)
         ops.rotary_embedding(
-            positions_repeated,
+            positions_for_rope,
             all_k_flat,
             None,
             self._rope_head_size,
