@@ -414,8 +414,14 @@ class DraftModelRunner:
         positions     = positions.to(device=self.device)
 
         blocks       = self.block_manager.allocate(T)
-        self.seq_block_tables[seq_id] = blocks
-        self.seq_lengths[seq_id]      = T
+        if seq_id in self.seq_block_tables:
+            # Chunked prefill: extend existing context rather than overwriting.
+            # Each chunk writes its own new blocks; accumulate them.
+            self.seq_block_tables[seq_id].extend(blocks)
+            self.seq_lengths[seq_id] += T
+        else:
+            self.seq_block_tables[seq_id] = blocks
+            self.seq_lengths[seq_id]      = T
 
         slot_mapping = self._compute_slot_mapping_for_sequence(blocks, T)
 
