@@ -36,3 +36,12 @@ Launcher 可以启用 vLLM 内置的 `OffloadingConnector`，通过 CPU 暂存�
 
 在 4xT10、Qwen3.8-27B AWQ-INT4、FP16 KV 上，整机重启后，相同的 1,929-token 提示词从 SSD 恢复了 1,568 tokens，输出与冷启动一致。文件系统层记录了 5 次命中和约 257 MB 读取。此路线仍属实验性，暂无正式吞吐成绩。
 在双 RTX 2080 Ti 上，同模型、FP16 KV 的 1,933-token 提示词在 vLLM 服务退出并重启后命中 1,568 tokens，输出保持一致。双 2080 Ti 测试未单独进行整机重启。
+
+还在双 RTX 2080 Ti（GPU 1、5）上验证了仓库正式 `fast` profile。Qwen3.8-27B
+W8A16 FP8 权重 / FP8 KV、MTP4、262K 纯文本路线使用 4 GiB CPU 暂存空间，服务重启后
+在 5,356 个提示 token 中命中 3,232 个。W4A16 NVFP4 权重 / FP8 KV、DFlash2、262K
+图文路线使用 8 GiB CPU 暂存空间，以纯文本请求测试，服务重启后在 5,355 个提示 token
+中命中 3,296 个；文件系统层记录 21 个 chunk 命中、读取 5,244,911,616 字节。两条路线的
+输出均与首次请求一致，都是 `READY`。这些测试未包含整机重启或吞吐基准。在这台主机上，
+MTP4 FP16 KV 148K 路线启用 SSD offload 时，需要通过 launcher 设置 `GPU_UTIL=0.965`
+才能保留其 148,480-token 容量；这是该主机的启动覆盖值，正式 profile 未修改。

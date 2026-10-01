@@ -206,6 +206,35 @@ def test_prepare_store_kv_non_writer_marks_completed_without_submit():
     assert meta.completed_jobs == {7: 1}
 
 
+def test_register_kv_caches_with_independent_block_pools():
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    block_counts = (4, 2)
+    names = ("target", "draft")
+    config = KVCacheConfig(
+        num_blocks=max(block_counts),
+        num_blocks_per_group=block_counts,
+        independent_block_pools=True,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([name], spec) for name in names],
+    )
+    kv_caches = {
+        name: torch.zeros((count, spec.page_size_bytes), dtype=torch.uint8)
+        for name, count in zip(names, block_counts)
+    }
+    worker, offload_spec = _make_worker(config)
+
+    worker.register_kv_caches(kv_caches)
+
+    canonical = offload_spec.get_worker.call_args[0][0]
+    assert [tensor.tensor.shape[0] for tensor in canonical.tensors] == [4, 2]
+    assert len(canonical.group_data_refs) == 2
+
+
 def test_prepare_store_kv_writer_submits_store():
     worker, _ = _make_worker(
         KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]),

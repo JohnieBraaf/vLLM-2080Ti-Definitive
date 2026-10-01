@@ -2615,6 +2615,19 @@ def _try_get_dflash_native_groups(
     ):
         return None
 
+    if vllm_config.speculative_config.use_eagle_block_drop():
+        # Offload lookup needs the sliding window plus one draft block before
+        # dropping the volatile speculative tail. Reserve another block for
+        # the partially filled right edge of a chunked prefill.
+        for name, spec in draft_specs.items():
+            assert isinstance(spec, SlidingWindowSpec)
+            draft_specs[name] = replace(
+                spec,
+                extra_retained_tokens=max(
+                    spec.extra_retained_tokens, 2 * spec.block_size
+                ),
+            )
+
     try:
         target_groups = _get_kv_cache_groups_uniform_page_size(
             unify_kv_cache_spec_page_size(target_specs)
@@ -2624,7 +2637,7 @@ def _try_get_dflash_native_groups(
         # FP16 pages together makes their sum the shared pool's block width,
         # multiplying every target block's allocation by the draft depth.
         draft_groups = create_kv_cache_group_specs(
-            kv_cache_spec, [[name] for name in draft_specs]
+            {**kv_cache_spec, **draft_specs}, [[name] for name in draft_specs]
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None

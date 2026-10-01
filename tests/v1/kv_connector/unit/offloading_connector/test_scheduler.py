@@ -181,7 +181,9 @@ def test_swa_offload_window_covers_unaligned_hit(boundary, eagle, left_state):
     manager.complete_load(job.keys, state.req_context)
 
 
-def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
+def _make_partial_tail_scheduler(
+    independent_block_pools: bool = False,
+) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.speculative_config = None
@@ -189,6 +191,7 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
         enable_kv_cache_events=True, publisher="null"
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.independent_block_pools = independent_block_pools
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
@@ -282,6 +285,35 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     assert recurrent_event.parent_block_hash is None
 
 
+def test_independent_pool_partial_tail_tracks_overlapping_block_ids():
+    scheduler = _make_partial_tail_scheduler(independent_block_pools=True)
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 99]
+    req_status.group_states[1].block_ids[:] = [0, 99]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={"req": [(1, 99, 28)]},
+        )
+    )
+
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    [job_id] = jobs
+    assert jobs[job_id].src_spec.block_ids.tolist() == [99, 99]
+    assert scheduler._block_id_to_pending_jobs == {
+        (0, 99): {job_id},
+        (1, 99): {job_id},
+    }
+    scheduler._remove_pending_job(job_id, scheduler._jobs[job_id].fenced_block_ids)
+    assert scheduler._block_id_to_pending_jobs == {}
+
+
 def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
     scheduler = _make_partial_tail_scheduler()
     _make_partial_tail_request(scheduler)
@@ -353,6 +385,68 @@ def test_aligned_boundary_store_flushes_before_block_reuse(cow_reuse):
     meta = scheduler.build_connector_meta(output)
 
     assert meta.jobs_to_flush == {job_id}
+
+
+def test_independent_pool_fence_matches_only_its_group():
+    scheduler = _make_partial_tail_scheduler(independent_block_pools=True)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    meta = scheduler.build_connector_meta(output)
+    [job_id] = meta.store_jobs
+    assert scheduler._block_id_to_pending_jobs == {(1, 99): {job_id}}
+
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["req"]
+    output.scheduled_cached_reqs.new_block_ids = [([99], [])]
+    assert scheduler.build_connector_meta(output).jobs_to_flush == set()
+
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["req"]
+    output.scheduled_cached_reqs.new_block_ids = [([], [99])]
+    assert scheduler.build_connector_meta(output).jobs_to_flush == {job_id}
+
+
+def test_independent_eagle_store_keeps_replay_window():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._independent_block_pools = True
+    scheduler.config = SimpleNamespace(
+        retention_interval=0,
+        alignment_tokens=4,
+        blocks_per_chunk=1,
+        dcp_world_size=1,
+        kv_group_configs=(SimpleNamespace(is_eagle_group=True),),
+    )
+    req = SimpleNamespace(num_prompt_tokens=14, shared_prefix_boundary=0)
+    boundaries = scheduler._reachable_store_boundaries(req)
+    assert boundaries == (8,)
+
+    spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    group = SimpleNamespace(
+        manager_cls=SlidingWindowManager,
+        kv_cache_spec=spec,
+        is_eagle_group=True,
+    )
+    assert scheduler._reachable_store_block_mask(
+        group,
+        start_chunk_idx=0,
+        end_chunk_idx=3,
+        final_segment_end_chunk_idx=None,
+        reachable_boundaries=boundaries,
+    ) == [True, True, True]
 
 
 def test_normal_store_excludes_align_mode_mamba_sources():
@@ -2965,6 +3059,7 @@ class TestEagle:
         scheduler._events_tracker = MagicMock()
         scheduler.manager = RecordingAllHitManager()
         scheduler.config = SimpleNamespace(
+            supports_partial_tail=False,
             kv_group_configs=(
                 SimpleNamespace(
                     tokens_per_chunk=12,
@@ -2975,6 +3070,7 @@ class TestEagle:
                     tokens_per_chunk=16,
                     sliding_window_size_in_chunks=1,
                     is_eagle_group=False,
+                    load_window_size_in_chunks=lambda _num_tokens: 1,
                 ),
             )
         )

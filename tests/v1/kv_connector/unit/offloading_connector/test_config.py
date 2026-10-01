@@ -337,6 +337,46 @@ def test_worker_kv_bytes_preserves_tensor_layout(packed: bool):
     assert offloading_config.cache.blocks_per_chunk == 2
 
 
+def test_worker_kv_bytes_with_independent_block_pools():
+    target = _full_attention_spec()
+    draft = _full_attention_spec()
+    target_blocks, draft_blocks = 8, 2
+    total_bytes = (
+        target.page_size_bytes * target_blocks
+        + draft.page_size_bytes * draft_blocks
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=target_blocks,
+        num_blocks_per_group=(target_blocks, draft_blocks),
+        independent_block_pools=True,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=total_bytes,
+                layers=[name],
+                layer_stride=spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+                offset=offset,
+            )
+            for name, spec, offset in (
+                ("target", target, 0),
+                ("draft", draft, target.page_size_bytes * target_blocks),
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec(["draft"], draft, is_eagle_group=True),
+        ],
+    )
+
+    offloading_config = build_offloading_config(
+        _make_vllm_config(), kv_cache_config
+    )
+
+    assert offloading_config.worker_kv_bytes_per_block == (
+        target.page_size_bytes + draft.page_size_bytes
+    )
+
+
 def test_hisparse_offloads_only_indexer_group():
     source = KVCacheGroupSpec(
         ["source"],

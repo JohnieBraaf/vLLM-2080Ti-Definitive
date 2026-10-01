@@ -64,3 +64,15 @@ read. This route remains experimental and has no published throughput claim.
 On dual RTX 2080 Ti, the same model and FP16 KV recovered 1,568 of 1,933
 prompt tokens after the vLLM service was stopped and restarted, with the same
 answer. The dual-2080-Ti run did not include a host reboot.
+
+The shipped `fast` profiles were also checked on dual RTX 2080 Ti (GPUs 1,5)
+with the Qwen3.8-27B checkpoints. The W8A16 FP8-weight / FP8-KV MTP4 262K
+text-only profile recovered 3,232 of 5,356 prompt tokens after a service
+restart with 4 GiB of CPU staging. The W4A16 NVFP4-weight / FP8-KV DFlash2
+262K text-and-image profile recovered 3,296 of 5,355 text prompt tokens after
+a service restart with 8 GiB of CPU staging; the filesystem tier reported 21
+chunk hits and 5,244,911,616 bytes read. Both returned the same `READY` answer
+as their cold runs. These checks did not include a host reboot or a throughput
+benchmark. On this host, the MTP4 FP16-KV 148K profile with SSD offloading
+needed `GPU_UTIL=0.965` to retain its advertised 148,480-token capacity;
+this is a launcher override for that host, not a change to the shipped profile.

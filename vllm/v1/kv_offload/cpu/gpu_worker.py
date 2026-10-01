@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import functools
 import time
 from collections import deque
@@ -203,8 +204,16 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    cudart = torch.cuda.cudart()
+    result = cudart.cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
+        # The non-pinned fallback must not leave this CUDA error pending for
+        # subsequent torch allocations and kernel warmup.
+        if torch.version.cuda is not None:
+            major = torch.version.cuda.split(".")[0]
+            ctypes.CDLL(f"libcudart.so.{major}").cudaGetLastError()
+        else:
+            ctypes.CDLL("libamdhip64.so").hipGetLastError()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
