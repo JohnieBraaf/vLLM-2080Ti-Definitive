@@ -136,7 +136,7 @@ def build_offloading_config(
 
     worker_kv_bytes_per_block = 0
     all_groups_selected = len(selected_groups) == len(kv_cache_config.kv_cache_groups)
-    if kv_cache_config.independent_block_pools:
+    if kv_cache_config.independent_block_pools and kv_cache_config.num_blocks > 0:
         worker_kv_bytes_per_block = sum(
             _group_kv_bytes_per_block(group) for _, group in selected_groups
         )

@@ -377,6 +377,26 @@ def test_worker_kv_bytes_with_independent_block_pools():
     )
 
 
+def test_zero_blocks_with_independent_pools_do_not_allocate_offload_staging():
+    spec = _full_attention_spec()
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        num_blocks_per_group=(0, 0),
+        independent_block_pools=True,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], spec),
+            KVCacheGroupSpec(["draft"], spec, is_eagle_group=True),
+        ],
+    )
+
+    offloading_config = build_offloading_config(
+        _make_vllm_config(), kv_cache_config
+    )
+
+    assert offloading_config.worker_kv_bytes_per_block == 0
+
+
 def test_hisparse_offloads_only_indexer_group():
     source = KVCacheGroupSpec(
         ["source"],

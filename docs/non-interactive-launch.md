@@ -41,6 +41,12 @@ capacity. The disk namespace does not include a digest of the checkpoint
 weights. Clear the cache directory after replacing weights at the same path or
 changing to an incompatible runtime.
 
+The filesystem tier does not evict old files or enforce a disk quota. Use a
+dedicated volume with sufficient free space, monitor its usage, and clear stale
+cache data while the service is stopped. `KV_DISK_CPU_BYTES` limits only host
+RAM staging. Keep the same `PYTHONHASHSEED` (default `0`) across restarts or
+previously stored prefixes will miss.
+
 ```bash
 ./launcher.sh \
   --model-dir /mnt/models/Qwen3.8-27B-AWQ-INT4 \

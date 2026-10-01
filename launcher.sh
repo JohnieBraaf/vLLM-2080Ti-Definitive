@@ -1758,8 +1758,11 @@ validate_disk_kv_cache_config() {
     echo "ERROR: Disk KV cache requires prefix caching to be enabled." >&2
     return 1
   fi
-  if [[ "${PYTHONHASHSEED:-0}" == random ]]; then
-    echo "ERROR: Disk KV cache requires a stable PYTHONHASHSEED." >&2
+  local hash_seed=${PYTHONHASHSEED:-0}
+  if [[ ! "$hash_seed" =~ ^[0-9]+$ ]] ||
+     (( ${#hash_seed} > 10 )) ||
+     (( 10#$hash_seed > 4294967295 )); then
+    echo "ERROR: Disk KV cache requires PYTHONHASHSEED in [0, 4294967295]." >&2
     return 1
   fi
 }
@@ -3327,6 +3330,11 @@ edit_advanced_parameters() {
   NO_ASYNC_SCHEDULING=$(prompt_toggle01 "No async scheduling" "${NO_ASYNC_SCHEDULING:-0}") || return 0
   DISABLE_HYBRID_KV_CACHE_MANAGER=$(prompt_toggle01 "Disable hybrid KV cache manager" "${DISABLE_HYBRID_KV_CACHE_MANAGER:-0}") || return 0
   DISABLE_PREFIX_CACHING=$(prompt_toggle01 "Disable prefix caching" "${DISABLE_PREFIX_CACHING:-0}") || return 0
+  if [[ "$DISABLE_PREFIX_CACHING" == "1" ]]; then
+    ENABLE_PREFIX_CACHING=0
+    KV_DISK_CACHE_DIR=""
+    KV_DISK_CPU_BYTES=""
+  fi
   CUSTOM_ALL_REDUCE_MODE=$(prompt_optional "Custom all-reduce mode (auto/off)" "${CUSTOM_ALL_REDUCE_MODE:-auto}") || return 0
   unset DISABLE_CUSTOM_ALL_REDUCE
   DISABLE_LOG_STATS=$(prompt_toggle01 "Disable log stats" "${DISABLE_LOG_STATS:-0}") || return 0
@@ -3428,6 +3436,8 @@ edit_prefix_cache_menu() {
     disabled)
       DISABLE_PREFIX_CACHING=1
       ENABLE_PREFIX_CACHING=0
+      KV_DISK_CACHE_DIR=""
+      KV_DISK_CPU_BYTES=""
       ;;
     *)
       ENABLE_PREFIX_CACHING=1
@@ -3440,14 +3450,17 @@ edit_prefix_cache_menu() {
 
 edit_disk_kv_cache_menu() {
   local choice dir cpu_bytes
-  choice=$(menu_select "Disk KV cache" "${KV_DISK_CACHE_DIR:-disabled}" disabled enabled) || return 0
+  local current=disabled
+  [[ -n "${KV_DISK_CACHE_DIR:-}" ]] && current=enabled
+  choice=$(menu_select "Disk KV cache" "$current" disabled enabled) || return 0
   if [[ "$choice" == enabled ]]; then
     dir=$(prompt_default "SSD cache directory" "${KV_DISK_CACHE_DIR:-/mnt/nvme/vllm-kv-cache}") || return 0
     cpu_bytes=$(prompt_default "CPU staging bytes" "${KV_DISK_CPU_BYTES:-4294967296}") || return 0
+    if ! KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes validate_disk_kv_cache_config; then
+      return 1
+    fi
     KV_DISK_CACHE_DIR=$dir
     KV_DISK_CPU_BYTES=$cpu_bytes
-    ENABLE_PREFIX_CACHING=1
-    DISABLE_PREFIX_CACHING=0
   else
     KV_DISK_CACHE_DIR=""
     KV_DISK_CPU_BYTES=""
@@ -5476,8 +5489,8 @@ launch_server() {
 
   if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
     mkdir -p -- "$KV_DISK_CACHE_DIR" || return 1
-    if [[ ! -w "$KV_DISK_CACHE_DIR" ]]; then
-      echo "ERROR: Disk KV cache directory is not writable: $KV_DISK_CACHE_DIR" >&2
+    if [[ ! -w "$KV_DISK_CACHE_DIR" || ! -x "$KV_DISK_CACHE_DIR" ]]; then
+      echo "ERROR: Disk KV cache directory must be writable and searchable: $KV_DISK_CACHE_DIR" >&2
       return 1
     fi
   fi
@@ -5885,6 +5898,7 @@ Launch summary:
   Prefix cache:         $(current_prefix_cache_label)
   Disk KV cache:        ${KV_DISK_CACHE_DIR:-disabled}
   CPU staging bytes:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$KV_DISK_CPU_BYTES" || printf 'n/a')
+  Disk KV hash seed:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "${PYTHONHASHSEED:-0}" || printf 'n/a')
   Custom all-reduce:    $(current_custom_all_reduce_label)
   Mamba cache mode:     ${MAMBA_CACHE_MODE:-auto}
   Context tokens:       $MAX_MODEL_LEN

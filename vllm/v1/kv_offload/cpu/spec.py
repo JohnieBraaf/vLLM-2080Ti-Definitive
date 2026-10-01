@@ -118,6 +118,11 @@ class CPUOffloadingSpec(OffloadingSpec):
                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
             )
             self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+            if self.num_chunks == 0:
+                raise ValueError(
+                    "cpu_bytes_to_use is too small for one aligned offload chunk "
+                    f"({aligned_kv_bytes_per_chunk} bytes required)."
+                )
 
             # Expose aligned_kv_bytes_per_chunk as
             # kv_bytes_per_chunk. Note that this might contain

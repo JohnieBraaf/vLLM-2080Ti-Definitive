@@ -223,7 +223,9 @@ def test_register_kv_caches_with_independent_block_pools():
         kv_cache_groups=[KVCacheGroupSpec([name], spec) for name in names],
     )
     kv_caches = {
-        name: torch.zeros((count, spec.page_size_bytes), dtype=torch.uint8)
+        name: torch.zeros(
+            (count, NUM_KV_HEADS, BLOCK_SIZE, 2 * HEAD_SIZE), dtype=DTYPE
+        )
         for name, count in zip(names, block_counts)
     }
     worker, offload_spec = _make_worker(config)
@@ -233,6 +235,10 @@ def test_register_kv_caches_with_independent_block_pools():
     canonical = offload_spec.get_worker.call_args[0][0]
     assert [tensor.tensor.shape[0] for tensor in canonical.tensors] == [4, 2]
     assert len(canonical.group_data_refs) == 2
+    for refs in canonical.group_data_refs:
+        assert refs[0].mapping is not None
+        assert refs[0].mapping.parallelism_agnostic
+        assert refs[0].mapping.local_page_size_bytes == spec.page_size_bytes
 
 
 def test_prepare_store_kv_writer_submits_store():

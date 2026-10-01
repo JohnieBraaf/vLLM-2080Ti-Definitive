@@ -67,5 +67,36 @@ if validate_disk_kv_cache_config 2>/dev/null; then
   echo "unstable hash seed unexpectedly accepted" >&2
   exit 1
 fi
+for PYTHONHASHSEED in abc 4294967296; do
+  if validate_disk_kv_cache_config 2>/dev/null; then
+    echo "invalid hash seed unexpectedly accepted: $PYTHONHASHSEED" >&2
+    exit 1
+  fi
+done
+PYTHONHASHSEED=4294967295
+validate_disk_kv_cache_config
+unset PYTHONHASHSEED
+
+save_manager_state() { :; }
+KV_DISK_CACHE_DIR=/mnt/nvme/kv-cache
+KV_DISK_CPU_BYTES=4294967296
+edit_disk_kv_cache_menu
+[[ "$KV_DISK_CACHE_DIR" == /mnt/nvme/kv-cache ]]
+
+prompt_default() {
+  case "$1" in
+    "SSD cache directory") printf 'relative/path\n' ;;
+    *) printf '%s\n' "$2" ;;
+  esac
+}
+if edit_disk_kv_cache_menu 2>/dev/null; then
+  echo "invalid menu path unexpectedly accepted" >&2
+  exit 1
+fi
+[[ "$KV_DISK_CACHE_DIR" == /mnt/nvme/kv-cache ]]
+
+menu_select() { printf 'disabled\n'; }
+edit_prefix_cache_menu
+[[ -z "$KV_DISK_CACHE_DIR" && -z "$KV_DISK_CPU_BYTES" ]]
 
 echo "Disk KV cache launcher checks passed"

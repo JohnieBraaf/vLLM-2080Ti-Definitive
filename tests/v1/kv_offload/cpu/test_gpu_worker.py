@@ -37,6 +37,20 @@ NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
 
 
+def test_pin_mmap_region_clears_failed_registration(monkeypatch):
+    runtime = MagicMock()
+    runtime.cudaHostRegister.return_value = MagicMock(value=1)
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    region = MagicMock(rank=0, total_size_bytes=4096, is_pinned=False)
+    region._base.data_ptr.return_value = 1234
+
+    gpu_worker.pin_mmap_region(region)
+
+    runtime.cudaGetLastError.assert_called_once_with()
+    assert not region.is_pinned
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
 def test_rocm_cpu_to_gpu_uses_dma(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_worker, "HAS_TRITON", True)
