@@ -179,6 +179,11 @@ def _sm75_spec_prefill_graph_query_len(
     kv_cache_spec: KVCacheSpec,
 ) -> int | None:
     """Return the one SM75 speculative query width safe for FULL capture."""
+    if (
+        current_platform.is_device_capability(75)
+        and os.environ.get("VLLM_SM75_SDPA_BYPASS", "0") == "1"
+    ):
+        return None
     speculative_config = vllm_config.speculative_config
     compilation_config = vllm_config.compilation_config
     if (
