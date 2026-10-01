@@ -719,8 +719,12 @@ class FlashInferBackend(AttentionBackend):
     _sm75: bool | None = None  # lazily set on first forward; True when SM75
 
     def _set_sm75(self, tensor: torch.Tensor) -> bool:
-        type(self)._sm75 = torch.cuda.get_device_capability(tensor.device) == (7, 5)
-        return type(self)._sm75
+        cached = getattr(type(self), '_sm75', None)
+        if cached is not None:
+            return cached
+        sm75 = torch.cuda.get_device_capability(tensor.device) == (7, 5)
+        type(self)._sm75 = sm75
+        return sm75
 
 
 @dataclass
@@ -2561,11 +2565,7 @@ class FlashInferImpl(AttentionImpl):
                         if (
                             isinstance(attn_metadata.prefill, FIPrefill)
                             and attn_metadata.prefill.sm75_paged_kv_indices is not None
-                            and (
-                                type(self)._sm75
-                                if type(self)._sm75 is not None
-                                else self._set_sm75(query)
-                            )
+                            and self._set_sm75(prefill_query)
                         ):
                             _sm75_paged_prefill_sdpa(
                                 prefill_query,
