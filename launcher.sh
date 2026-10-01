@@ -1790,6 +1790,21 @@ print(json.dumps({
 PY
 }
 
+prepare_disk_kv_checkpoint_fingerprint() {
+  DISK_KV_CHECKPOINT_FINGERPRINT=""
+  [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
+
+  local method draft_checkpoint=""
+  method=$(effective_speculative_method)
+  if [[ "$method" != none && "$method" != mtp && -n "$method" ]]; then
+    draft_checkpoint=$(effective_speculative_model)
+  fi
+  DISK_KV_CHECKPOINT_FINGERPRINT=$(
+    python3 "$PROJECT_ROOT/tools/checkpoint_fingerprint.py" \
+      "$MODEL_DIR" "$draft_checkpoint"
+  ) || return 1
+}
+
 current_tq_diagnostics_label() {
   if [[ "${KV_CACHE_DTYPE:-}" != turboquant_* ]]; then
     printf 'n/a'
@@ -5868,16 +5883,7 @@ prepare_runtime_defaults() {
   validate_mode_kv_policy
   validate_spec_decode_metrics
   validate_speculative_route || return 1
-  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
-    local draft_checkpoint
-    draft_checkpoint=$(effective_speculative_model)
-    DISK_KV_CHECKPOINT_FINGERPRINT=$(
-      python3 "$PROJECT_ROOT/tools/checkpoint_fingerprint.py" \
-        "$MODEL_DIR" "$draft_checkpoint"
-    ) || return 1
-  else
-    DISK_KV_CHECKPOINT_FINGERPRINT=""
-  fi
+  prepare_disk_kv_checkpoint_fingerprint || return 1
 }
 
 collect_config_env() {

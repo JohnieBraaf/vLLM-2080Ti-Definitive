@@ -18,8 +18,23 @@ def _stat_identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def _checkpoint_files(root: Path, role: str) -> list[Path]:
+    files = []
+    for path in root.rglob("*"):
+        if path.is_symlink() and path.is_dir():
+            raise ValueError(f"directory symlink in {role} checkpoint: {path}")
+        if path.is_symlink() and not path.exists():
+            raise ValueError(f"broken symlink in {role} checkpoint: {path}")
+        if path.is_file():
+            files.append(path)
+    if not files:
+        raise ValueError(f"{role} checkpoint has no files: {root}")
+    return sorted(files)
+
+
 def fingerprint_checkpoints(model_dir: str, draft_dir: str = "") -> str:
     digest = hashlib.sha256()
+    snapshots = []
     for role, directory in (("target", model_dir), ("draft", draft_dir)):
         if not directory:
             continue
@@ -27,29 +42,29 @@ def fingerprint_checkpoints(model_dir: str, draft_dir: str = "") -> str:
         if not root.is_dir():
             raise ValueError(f"{role} checkpoint is not a directory: {directory}")
 
-        files = []
-        for path in root.rglob("*"):
-            if path.is_symlink() and path.is_dir():
-                raise ValueError(f"directory symlink in {role} checkpoint: {path}")
-            if path.is_symlink() and not path.exists():
-                raise ValueError(f"broken symlink in {role} checkpoint: {path}")
-            if path.is_file():
-                files.append(path)
-        if not files:
-            raise ValueError(f"{role} checkpoint has no files: {directory}")
+        files = _checkpoint_files(root, role)
+        snapshots.append((root, role, files, {}))
+        file_stats = snapshots[-1][3]
 
         digest.update(role.encode() + b"\0")
-        for path in sorted(files):
+        for path in files:
             relative = path.relative_to(root).as_posix().encode()
             digest.update(len(relative).to_bytes(8, "big"))
             digest.update(relative)
             before = path.stat()
+            file_stats[path] = _stat_identity(before)
             digest.update(before.st_size.to_bytes(16, "big"))
             with path.open("rb") as source:
                 while chunk := source.read(8 * 1024 * 1024):
                     digest.update(chunk)
             after = path.stat()
             if _stat_identity(before) != _stat_identity(after):
+                raise ValueError(f"checkpoint file changed while hashing: {path}")
+    for root, role, files, file_stats in snapshots:
+        if _checkpoint_files(root, role) != files:
+            raise ValueError(f"{role} checkpoint file set changed while hashing: {root}")
+        for path in files:
+            if _stat_identity(path.stat()) != file_stats[path]:
                 raise ValueError(f"checkpoint file changed while hashing: {path}")
     return digest.hexdigest()
 

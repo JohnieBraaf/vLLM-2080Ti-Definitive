@@ -42,7 +42,8 @@ local draft checkpoints before loading the model. The content digest selects
 a separate disk namespace, so replacing weights at the same path cannot load
 old KV. This adds one full checkpoint read to startup; old namespaces must be
 removed manually to reclaim space. Clear the cache after changing to an
-incompatible runtime. Disk caching requires local checkpoint directories.
+incompatible runtime. Disk caching requires local checkpoint directories;
+do not modify checkpoint files while the launcher starts or the service runs.
 
 The filesystem tier does not evict old files or enforce a disk quota. Use a
 dedicated volume with sufficient free space, monitor its usage, and clear stale

@@ -8,28 +8,39 @@ source "$ROOT/launcher.sh"
 fixture_dir=$(mktemp -d)
 trap 'rm -rf -- "$fixture_dir"' EXIT
 MODEL_DIR="$fixture_dir/model"
-SPECULATIVE_MODEL=""
-mkdir -p "$MODEL_DIR" "$fixture_dir/draft"
-printf 'original weights\n' > "$MODEL_DIR/model.safetensors"
-printf 'draft weights\n' > "$fixture_dir/draft/model.safetensors"
-DISK_KV_CHECKPOINT_FINGERPRINT=$(
-  python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR"
-)
-original_fingerprint=$DISK_KV_CHECKPOINT_FINGERPRINT
-[[ "$(python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR")" == "$original_fingerprint" ]]
-printf 'replacement weights\n' > "$MODEL_DIR/model.safetensors"
-replacement_fingerprint=$(python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR")
-[[ "$replacement_fingerprint" != "$original_fingerprint" ]]
-draft_fingerprint=$(
-  python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR" "$fixture_dir/draft"
-)
-[[ "$draft_fingerprint" != "$replacement_fingerprint" ]]
-DISK_KV_CHECKPOINT_FINGERPRINT=$replacement_fingerprint
-
+SPECULATIVE_METHOD=none
+SPECULATIVE_MODEL=unused/repo-id
 KV_DISK_CACHE_DIR=/mnt/nvme/kv-cache
 KV_DISK_CPU_BYTES=4294967296
 ENABLE_PREFIX_CACHING=1
 DISABLE_PREFIX_CACHING=0
+mkdir -p "$MODEL_DIR" "$fixture_dir/draft"
+printf 'original weights\n' > "$MODEL_DIR/model.safetensors"
+printf 'draft weights\n' > "$fixture_dir/draft/model.safetensors"
+prepare_disk_kv_checkpoint_fingerprint
+original_fingerprint=$DISK_KV_CHECKPOINT_FINGERPRINT
+prepare_disk_kv_checkpoint_fingerprint
+[[ "$DISK_KV_CHECKPOINT_FINGERPRINT" == "$original_fingerprint" ]]
+printf 'replacement weights\n' > "$MODEL_DIR/model.safetensors"
+prepare_disk_kv_checkpoint_fingerprint
+replacement_fingerprint=$DISK_KV_CHECKPOINT_FINGERPRINT
+[[ "$replacement_fingerprint" != "$original_fingerprint" ]]
+SPECULATIVE_METHOD=mtp
+prepare_disk_kv_checkpoint_fingerprint
+[[ "$DISK_KV_CHECKPOINT_FINGERPRINT" == "$replacement_fingerprint" ]]
+SPECULATIVE_METHOD=dflash
+SPECULATIVE_MODEL="$fixture_dir/draft"
+prepare_disk_kv_checkpoint_fingerprint
+draft_fingerprint=$DISK_KV_CHECKPOINT_FINGERPRINT
+[[ "$draft_fingerprint" != "$replacement_fingerprint" ]]
+printf 'new draft weights\n' > "$fixture_dir/draft/model.safetensors"
+prepare_disk_kv_checkpoint_fingerprint
+[[ "$DISK_KV_CHECKPOINT_FINGERPRINT" != "$draft_fingerprint" ]]
+SPECULATIVE_METHOD=none
+SPECULATIVE_MODEL=unused/repo-id
+prepare_disk_kv_checkpoint_fingerprint
+[[ "$DISK_KV_CHECKPOINT_FINGERPRINT" == "$replacement_fingerprint" ]]
+
 validate_disk_kv_cache_config
 
 config=$(disk_kv_transfer_config)
