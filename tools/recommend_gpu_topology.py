@@ -2,16 +2,16 @@
 """Recommend TP rank groups from the local NVIDIA topology matrix."""
 
 import argparse
-from functools import lru_cache
-from itertools import combinations
 import json
 import re
 import subprocess
 import sys
-
+from functools import lru_cache
+from itertools import combinations
 
 LINK_SCORE = {"PIX": 40, "PXB": 30, "PHB": 20, "NODE": 10, "SYS": 0}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+MAX_SELECTED_GPUS = 12
 
 
 def read_matrix(text):
@@ -48,6 +48,10 @@ def link_score(value):
 def recommend(devices, tp_size, topology, p2p=None):
     if not devices or len(set(devices)) != len(devices) or len(devices) % tp_size:
         raise ValueError("selected GPUs must be unique and divisible by TP size")
+    if len(devices) > MAX_SELECTED_GPUS:
+        raise ValueError(
+            f"topology ranking supports at most {MAX_SELECTED_GPUS} selected GPUs"
+        )
     names = [f"GPU{device}" for device in devices]
     for left in names:
         for right in names:
@@ -57,6 +61,7 @@ def recommend(devices, tp_size, topology, p2p=None):
     if tp_size == 1:
         groups = [(name,) for name in names]
     else:
+
         @lru_cache(None)
         def partition(remaining):
             if not remaining:
@@ -91,7 +96,11 @@ def recommend(devices, tp_size, topology, p2p=None):
         f"TP{index}=[{','.join(name[3:] for name in group)}]"
         for index, group in enumerate(groups)
     )
-    summary += "; P2P read/write checked." if p2p is not None else "; P2P probe unavailable."
+    summary += (
+        "; P2P read/write checked." if p2p is not None else "; P2P probe unavailable."
+    )
+    if len(groups) > 1:
+        summary += " PP stage order follows the selected order."
     return {"ordered_devices": ",".join(ordered), "summary": summary}
 
 
@@ -117,7 +126,9 @@ def main():
             writes = read_matrix(probe(["nvidia-smi", "topo", "-p2p", "w"]))
             p2p = {
                 left: {
-                    right: "OK" if reads[left][right] == writes[left][right] == "OK" else "NS"
+                    right: "OK"
+                    if reads[left][right] == writes[left][right] == "OK"
+                    else "NS"
                     for right in reads[left]
                 }
                 for left in reads

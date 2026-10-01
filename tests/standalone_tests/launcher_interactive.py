@@ -4,14 +4,14 @@
 import errno
 import importlib.util
 import os
-from pathlib import Path
 import pty
 import select
 import subprocess
 import tempfile
 import time
 import unittest
-
+from contextlib import suppress
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -34,7 +34,9 @@ def run_tty(command, exchanges):
             deadline = time.monotonic() + 10
             while marker.encode() not in output[search_start:]:
                 if time.monotonic() > deadline:
-                    raise AssertionError(f"PTY prompt not seen: {marker}; output={output[-800:]!r}")
+                    raise AssertionError(
+                        f"PTY prompt not seen: {marker}; output={output[-800:]!r}"
+                    )
                 ready, _, _ = select.select([master], [], [], 0.1)
                 if ready:
                     try:
@@ -141,8 +143,13 @@ class LauncherInteractiveTest(unittest.TestCase):
             pid_file.write_text(f"{startup.pid}\n")
             try:
                 subprocess.run(
-                    ["bash", "-c", 'source ./launcher.sh; cleanup_cancelled_launch "$1"',
-                     "_", str(pid_file)],
+                    [
+                        "bash",
+                        "-c",
+                        'source ./launcher.sh; cleanup_cancelled_launch "$1"',
+                        "_",
+                        str(pid_file),
+                    ],
                     cwd=ROOT,
                     check=True,
                 )
@@ -155,19 +162,101 @@ class LauncherInteractiveTest(unittest.TestCase):
                         process.terminate()
                     process.wait(timeout=5)
 
+    def test_cancel_cleanup_finds_reparented_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = "launcher-test-orphan-worker"
+            parent = subprocess.run(
+                ["bash", "-c", 'sleep 30 >/dev/null 2>&1 & printf "%s\\n" "$!"'],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "VLLM_LAUNCH_TOKEN": token},
+                start_new_session=True,
+                check=True,
+            )
+            worker_pid = int(parent.stdout.strip())
+            unrelated = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            pid_file = Path(directory) / "startup.pid"
+            pid_file.write_text("999999\n")
+            Path(f"{pid_file}.token").write_text(f"{token}\n")
+            try:
+                subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source ./launcher.sh; cleanup_cancelled_launch "$1"',
+                        "_",
+                        str(pid_file),
+                    ],
+                    cwd=ROOT,
+                    check=True,
+                )
+                self.assertIsNone(unrelated.poll())
+                self.assertFalse(pid_file.exists())
+                state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(worker_pid)],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertTrue(not state or state.startswith("Z"), state)
+            finally:
+                if unrelated.poll() is None:
+                    unrelated.terminate()
+                unrelated.wait(timeout=5)
+                with suppress(ProcessLookupError):
+                    os.kill(worker_pid, 9)
+
+    def test_failed_cancel_keeps_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "startup.pid"
+            pid_file.write_text("999999\n")
+            Path(f"{pid_file}.token").write_text("test-token\n")
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "source ./launcher.sh; "
+                    "launch_token_pids() { echo 999998; }; "
+                    'cleanup_cancelled_launch "$1"',
+                    "_",
+                    str(pid_file),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(pid_file.exists())
+            self.assertTrue(Path(f"{pid_file}.token").exists())
+
+    def test_noninteractive_tty_does_not_read_startup_keys(self):
+        output, code = run_tty(
+            "source ./launcher.sh; NON_INTERACTIVE=1; "
+            "if startup_can_read_tty; then echo RESULT:yes; else echo RESULT:no; fi",
+            [],
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("RESULT:no", output)
+
     def test_topology_groups_preserve_p2p(self):
         matrix = "\x1b[4mGPU0 GPU1 GPU2 GPU3 CPU Affinity\x1b[0m\n"
         matrix += "GPU0 X PHB PIX PHB 0-3\nGPU1 PHB X PHB PIX 0-3\n"
         matrix += "GPU2 PIX PHB X PHB 0-3\nGPU3 PHB PIX PHB X 0-3\n"
         links = topology.read_matrix(matrix)
         p2p = {
-            a: {b: "OK" if a == b or {a, b} in (
-                {"GPU0", "GPU2"}, {"GPU1", "GPU3"}
-            ) else "CNS" for b in links}
+            a: {
+                b: "OK"
+                if a == b or {a, b} in ({"GPU0", "GPU2"}, {"GPU1", "GPU3"})
+                else "CNS"
+                for b in links
+            }
             for a in links
         }
         result = topology.recommend(["0", "1", "2", "3"], 2, links, p2p)
         self.assertEqual(result["ordered_devices"], "0,2,1,3")
+
+    def test_topology_search_has_device_bound(self):
+        with self.assertRaisesRegex(ValueError, "at most 12"):
+            topology.recommend([str(index) for index in range(13)], 1, {})
 
 
 if __name__ == "__main__":

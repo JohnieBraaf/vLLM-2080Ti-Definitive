@@ -1906,7 +1906,7 @@ select_model_path() {
     done < "$file"
   fi
   if ((${#choices[@]} > 1)); then
-    [[ "$required" == 1 ]] || choices+=("Clear draft model")
+    [[ "$required" == 0 ]] && choices+=("Clear draft model")
     selected=$(menu_select "$label (recent directories)" "${default:-Enter another path}" "${choices[@]}") || return 1
     case "$selected" in
       "Clear draft model") printf '\n'; return 0 ;;
@@ -1914,11 +1914,18 @@ select_model_path() {
       *) record_model_history "$kind" "$selected" || true; printf '%s\n' "$selected"; return 0 ;;
     esac
   fi
-  if [[ "$required" == 1 ]]; then
-    selected=$(prompt_required_dir "$label" "$default") || return 1
-  else
-    selected=$(prompt_optional "$label" "$default") || return 1
-  fi
+  case "$required" in
+    1) selected=$(prompt_required_dir "$label" "$default") || return 1 ;;
+    2)
+      while true; do
+        selected=$(prompt_default "$label" "$default") || return 1
+        [[ -n "$selected" ]] && break
+        is_tty || return 1
+        echo "Draft model path or repository is required." >/dev/tty
+      done
+      ;;
+    *) selected=$(prompt_optional "$label" "$default") || return 1 ;;
+  esac
   record_model_history "$kind" "$selected" || true
   printf '%s\n' "$selected"
 }
@@ -3549,7 +3556,7 @@ edit_speculative_decode_menu() {
       if [[ "$default_tokens" == "0" ]]; then
         default_tokens=${SPECULATIVE_TOKENS:-7}
       fi
-      draft_model=$(select_model_path draft "DFlash2 draft model path or repo" "$(effective_speculative_model)" 0) || return 0
+      draft_model=$(select_model_path draft "DFlash2 draft model path or repo" "$(effective_speculative_model)" 2) || return 0
       tokens=$(prompt_default "DFlash speculative tokens" "$default_tokens") || return 0
       draft_tp=$(prompt_optional "DFlash draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
       draft_max_model_len=$(prompt_optional "DFlash draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
@@ -3895,6 +3902,10 @@ clear_last_service_state() {
 stop_pid_file() {
   local pid_file=$1
   local pid descendants
+  if [[ -f "${pid_file}.token" ]]; then
+    cleanup_cancelled_launch "$pid_file"
+    return $?
+  fi
   pid=$(cat "$pid_file" 2>/dev/null || true)
   if ! pid_is_running "$pid"; then
     rm -f "$pid_file"
@@ -3911,7 +3922,7 @@ stop_pid_file() {
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
       cleanup_vllm_worker_residuals || true
-      rm -f "$pid_file"
+      rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
     sleep 0.5
@@ -3923,7 +3934,7 @@ stop_pid_file() {
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
       cleanup_vllm_worker_residuals force || true
-      rm -f "$pid_file"
+      rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
     sleep 0.5
@@ -4052,7 +4063,7 @@ cleanup_failed_launch() {
     stop_pid_tree "$pid" || true
     sleep 1
     stop_pid_tree "$pid" force || true
-    rm -f "$pid_file"
+    rm -f "$pid_file" "${pid_file}.token"
   fi
   cleanup_vllm_residuals "${PORT:-}" "${SERVED_NAME:-}" "${MODEL_DIR:-}" || true
   cleanup_vllm_worker_residuals || true
@@ -4060,18 +4071,61 @@ cleanup_failed_launch() {
   cleanup_vllm_worker_residuals force || true
 }
 
+launch_token_pids() {
+  local token=$1 entry="VLLM_LAUNCH_TOKEN=$1" environ pid
+  [[ -n "$token" ]] || return 0
+  for environ in /proc/[0-9]*/environ; do
+    pid=${environ#/proc/}
+    pid=${pid%/environ}
+    [[ "$pid" != "$$" ]] || continue
+    grep -zFxq -- "$entry" "$environ" 2>/dev/null && printf '%s\n' "$pid"
+  done
+  return 0
+}
+
+pid_is_active() {
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  [[ -n "$state" && "$state" != Z* ]]
+}
+
+managed_pid_is_active() {
+  local pid=$1 token=$2
+  pid_is_active "$pid" || return 1
+  [[ -z "$token" ]] || grep -zFxq -- "VLLM_LAUNCH_TOKEN=$token" "/proc/$pid/environ" 2>/dev/null
+}
+
 cleanup_cancelled_launch() {
-  local pid_file=$1 pid descendants
+  local pid_file=$1 pid token descendants remaining attempts
   [[ -f "$pid_file" ]] || return 0
   pid=$(cat "$pid_file" 2>/dev/null || true)
-  [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$pid_file"; return 0; }
-  descendants=$(collect_descendant_pids "$pid")
-  stop_pid_tree "$pid" || true
-  wait_recorded_pids_stopped "$pid" 10 || true
-  stop_pid_tree "$pid" force || true
+  token=$(cat "${pid_file}.token" 2>/dev/null || true)
+  descendants=""
+  if [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"; then
+    descendants=$(collect_descendant_pids "$pid")
+    stop_pid_tree "$pid" || true
+  fi
+  for ((attempts = 0; attempts < 10; attempts++)); do
+    remaining=$(launch_token_pids "$token")
+    [[ -n "$remaining" ]] || break
+    stop_recorded_pids "$remaining" || true
+    sleep 0.5
+  done
+  remaining=$(launch_token_pids "$token")
+  stop_recorded_pids "$remaining" force || true
   stop_recorded_pids "$descendants" force || true
-  wait_recorded_pids_stopped "$descendants" 10 || true
-  rm -f "$pid_file"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"; then
+    stop_pid_tree "$pid" force || true
+  fi
+  sleep 0.5
+  remaining=$(launch_token_pids "$token")
+  if [[ -n "$remaining" ]] || {
+    [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"
+  }; then
+    printf 'ERROR: Startup cancellation left managed processes running; kept %s for retry.\n' "$pid_file" >&2
+    return 1
+  fi
+  rm -f "$pid_file" "${pid_file}.token"
 }
 
 stop_all_managed_services() {
@@ -5020,7 +5074,7 @@ wait_for_ready() {
       echo "Starting server... elapsed=${elapsed}s | status=$hint"
       last_notice=$elapsed
     fi
-    if is_tty; then
+    if startup_can_read_tty; then
       printf '\n  Press Esc to cancel startup.\n' >/dev/tty
       if read_startup_cancel_request; then
         return 130
@@ -5034,6 +5088,14 @@ wait_for_ready() {
     printf 'Startup timed out after %ss.\n' "$START_TIMEOUT" >/dev/tty
   fi
   return 2
+}
+
+startup_can_read_tty() {
+  local pgid tpgid
+  [[ -t 0 && "${NON_INTERACTIVE:-0}" != 1 ]] || return 1
+  pgid=$(ps -o pgid= -p "$$" 2>/dev/null) || return 1
+  tpgid=$(ps -o tpgid= -p "$$" 2>/dev/null) || return 1
+  [[ "${pgid//[[:space:]]/}" == "${tpgid//[[:space:]]/}" ]]
 }
 
 read_startup_cancel_request() {
@@ -5082,7 +5144,7 @@ run_compile_prewarm() {
   local original_len=$MAX_MODEL_LEN
   local original_name=$SERVED_NAME
   local original_pid=${CURRENT_SERVER_PID:-}
-  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0
+  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0 cleanup_rc=0 launch_token
 
   prewarm_name="${SERVED_NAME}-compile-prewarm-${prewarm_len}"
   prewarm_safe=$(printf '%s' "$prewarm_name" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_*$//')
@@ -5116,17 +5178,19 @@ run_compile_prewarm() {
   echo "Running compile prewarm at max_model_len=$prewarm_len, then retrying the original $original_len context."
   echo "  Prewarm log: $prewarm_log"
 
+  launch_token="prewarm-$$-$STAMP-$RANDOM$RANDOM"
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+    nohup setsid env "VLLM_LAUNCH_TOKEN=$launch_token" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
   else
-    nohup "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+    nohup env "VLLM_LAUNCH_TOKEN=$launch_token" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
   fi
   CURRENT_SERVER_PID=$!
   echo "$CURRENT_SERVER_PID" > "$prewarm_pid_file"
+  echo "$launch_token" > "${prewarm_pid_file}.token"
 
   wait_for_ready "$prewarm_log" "$url_host" || ready_rc=$?
   if [[ "$ready_rc" == "130" ]]; then
-    cleanup_cancelled_launch "$prewarm_pid_file" || true
+    cleanup_cancelled_launch "$prewarm_pid_file" || cleanup_rc=1
   else
     cleanup_failed_launch "$prewarm_pid_file" || true
   fi
@@ -5137,6 +5201,7 @@ run_compile_prewarm() {
   build_args "$host_arg"
 
   if [[ "$ready_rc" == "130" ]]; then
+    [[ "$cleanup_rc" == 0 ]] || return 131
     return 130
   fi
   if [[ "$ready_rc" == "0" ]]; then
@@ -5462,7 +5527,7 @@ maybe_run_startup_performance_test() {
 
 launch_server() {
   mkdir -p "$LOG_DIR"
-  local safe_name log_file pid_file host_arg url_host args_text
+  local safe_name log_file pid_file host_arg url_host args_text launch_token
   local -a server_env=(env)
   if [[ -z "${SERVED_NAME:-}" ]]; then
     SERVED_NAME=$(basename "$MODEL_DIR")
@@ -5549,6 +5614,8 @@ launch_server() {
   echo "  Model: $MODEL_DIR"
   echo "  Bind: $host_arg:$PORT"
 
+  launch_token="launch-$$-$STAMP-$RANDOM$RANDOM"
+  server_env+=("VLLM_LAUNCH_TOKEN=$launch_token")
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "${server_env[@]}" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$log_file" 2>&1 &
   else
@@ -5556,6 +5623,7 @@ launch_server() {
   fi
   CURRENT_SERVER_PID=$!
   echo "$CURRENT_SERVER_PID" > "$pid_file"
+  echo "$launch_token" > "${pid_file}.token"
 
   local ready_rc=0
   wait_for_ready "$log_file" "$url_host" || ready_rc=$?
@@ -5563,7 +5631,10 @@ launch_server() {
     local prewarm_len retry_rc
     if [[ "$ready_rc" == "130" ]]; then
       echo "Startup cancelled; cleaning up server processes."
-      cleanup_cancelled_launch "$pid_file"
+      if ! cleanup_cancelled_launch "$pid_file"; then
+        restore_overcommit_memory || true
+        return 131
+      fi
       restore_overcommit_memory || true
       return 130
     fi
@@ -5583,9 +5654,9 @@ launch_server() {
           return "$retry_rc"
         else
           retry_rc=$?
-          if [[ "$retry_rc" == "130" ]]; then
+          if [[ "$retry_rc" == "130" || "$retry_rc" == "131" ]]; then
             restore_overcommit_memory || true
-            return 130
+            return "$retry_rc"
           fi
         fi
       fi
