@@ -515,12 +515,14 @@ class DraftModelRunner:
             input_ids[_i * num_query_per_req] = int(_bids[_i].item())
 
         # Positions: newly-appended token is at (context_lens[i] - 1),
-        # query tokens at context_lens[i] - 1 + j for j in [0, num_query_per_req).
+        # query tokens at context_lens[i] + j for j in [0, num_query_per_req).
+        # Co-located reference: positions start at last_pos+1 (AFTER bonus context slot),
+        # not at last_pos. Off-by-one here was causing ~55% acceptance vs ~98%.
         query_positions = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i in range(B):
             base = int(positions[i].item())
             for j in range(num_query_per_req):
-                query_positions[i * num_query_per_req + j] = base + j
+                query_positions[i * num_query_per_req + j] = base + 1 + j
 
         # Slot mapping for query tokens.
         # The bonus slot (j=0) reuses position T_old = positions[i] — the same
@@ -531,9 +533,9 @@ class DraftModelRunner:
         for i, seq_id in enumerate(seq_ids):
             blocks   = self.seq_block_tables[seq_id]
             pre_query_counts.append(len(blocks))   # save BEFORE extending
-            T_bonus  = int(positions[i].item())   # = T_old (bonus position)
+            T_bonus  = int(positions[i].item())   # = T_old (bonus position in context)
             for j in range(num_query_per_req):
-                pos = T_bonus + j                 # T_old, T_old+1, …, T_old+K
+                pos = T_bonus + 1 + j             # T_old+1, T_old+2, …, T_old+K+1
                 while pos >= len(blocks) * bs:
                     blocks.append(self.block_manager.allocate_one())
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
