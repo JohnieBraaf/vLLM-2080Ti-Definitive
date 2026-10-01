@@ -2,17 +2,17 @@
 """SM75 (Turing) Triton paged cross-attention for NHD KV cache layout.
 
 Raw kv_cache: NHD 4D [num_blocks, nkv, block_size, 2*head_dim].
+K = kv_cache[:, :, :, :head_dim], V = kv_cache[:, :, :, head_dim:].
 
-Design: one program per (request, query_head), batch over QUERY_LEN tokens.
-HEAD_DIM=128 is split into two 64-wide chunks so each tl.dot tile fits within
-SM75's 64 KB SMEM limit. Uses FP16 tensor cores for compute.
+Design: one program per (query_token, query_head) — avoids tl.dot
+SMEM pressure by using tl.sum instead of tensor-core matmuls. Each
+instance holds HEAD_DIM-sized register vectors, well within SM75's
+64 KB SMEM limit. CUDA-graph-safe: all shapes are fixed; variable
+context is read from in-place-updated GPU tensors.
 """
 
 import torch
 from vllm.triton_utils import tl, triton
-
-# Half of HEAD_DIM — must divide HEAD_DIM evenly.
-_CHUNK_D = 64
 
 
 @triton.jit
@@ -30,37 +30,35 @@ def _nhd_paged_cross_attn_fwd(
     # Scaling
     scale,
     # Compile-time constants
-    QUERY_LEN:  tl.constexpr,   # K+1, typically 8
+    QUERY_LEN: tl.constexpr,    # K+1, typically 8
     BLOCK_SIZE: tl.constexpr,   # page_size, 16
-    HEAD_DIM:   tl.constexpr,   # head_dim, 128
-    CHUNK_D:    tl.constexpr,   # HEAD_DIM // 2 = 64
-    GQA_RATIO:  tl.constexpr,   # nq // nkv
+    HEAD_DIM: tl.constexpr,     # head_dim, 128
+    GQA_RATIO: tl.constexpr,    # nq // nkv
 ):
-    """Batch over QUERY_LEN; HEAD_DIM split into 2×CHUNK_D to fit 64 KB SMEM."""
-    req_id  = tl.program_id(0)
-    q_head  = tl.program_id(1)
+    """One program per (query_token_index, query_head_index).
+
+    Uses tl.sum instead of tl.dot to avoid tl.dot's MMA SMEM tiles,
+    which exceed SM75's 64 KB shared-memory limit when HEAD_DIM=128.
+    """
+    tok_idx = tl.program_id(0)   # 0 .. num_reqs * QUERY_LEN - 1
+    q_head  = tl.program_id(1)   # 0 .. nq - 1
+
+    req_id  = tok_idx // QUERY_LEN
     kv_head = q_head // GQA_RATIO
 
-    q_base = req_id * QUERY_LEN
-    offs_t = tl.arange(0, QUERY_LEN)
+    offs_d = tl.arange(0, HEAD_DIM)
     offs_l = tl.arange(0, BLOCK_SIZE)
-    offs_c = tl.arange(0, CHUNK_D)
 
-    # ── Load q in two halves: each [QUERY_LEN, CHUNK_D] ──────────────────────
-    q0 = tl.load(Q
-                 + (q_base + offs_t[:, None]) * q_stride_t
-                 + q_head * q_stride_h
-                 + offs_c[None, :] * q_stride_d).to(tl.float16)        # chunk 0
-    q1 = tl.load(Q
-                 + (q_base + offs_t[:, None]) * q_stride_t
-                 + q_head * q_stride_h
-                 + (CHUNK_D + offs_c[None, :]) * q_stride_d).to(tl.float16)  # chunk 1
+    # ── Load query vector: [HEAD_DIM] ─────────────────────────────────────────
+    q = tl.load(Q
+                + tok_idx * q_stride_t
+                + q_head  * q_stride_h
+                + offs_d  * q_stride_d).to(tl.float32)
 
-    # ── Online softmax accumulators ───────────────────────────────────────────
-    m    = tl.full((QUERY_LEN,), float("-inf"), dtype=tl.float32)
-    l    = tl.zeros((QUERY_LEN,), dtype=tl.float32)
-    acc0 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
-    acc1 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
+    # ── Online softmax state (scalars) ────────────────────────────────────────
+    m   = float("-inf")
+    l   = 0.0
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
 
     # ── Page range for this request ───────────────────────────────────────────
     page_start = tl.load(kv_indptr + req_id)
@@ -75,62 +73,43 @@ def _nhd_paged_cross_attn_fwd(
 
         kv_base = KV + block_idx * kv_stride_b + kv_head * kv_stride_h
 
-        # K chunk 0: [BLOCK_SIZE, CHUNK_D]
-        k0 = tl.load(kv_base
-                     + offs_l[:, None] * kv_stride_l
-                     + offs_c[None, :] * kv_stride_c,
-                     mask=offs_l[:, None] < valid,
-                     other=0.0).to(tl.float16)
-        # K chunk 1: [BLOCK_SIZE, CHUNK_D]
-        k1 = tl.load(kv_base
-                     + offs_l[:, None] * kv_stride_l
-                     + (CHUNK_D + offs_c[None, :]) * kv_stride_c,
-                     mask=offs_l[:, None] < valid,
-                     other=0.0).to(tl.float16)
+        # K: [BLOCK_SIZE, HEAD_DIM]
+        k = tl.load(kv_base
+                    + offs_l[:, None] * kv_stride_l
+                    + offs_d[None, :] * kv_stride_c,
+                    mask=offs_l[:, None] < valid,
+                    other=0.0).to(tl.float32)
 
-        # Scores: q0@k0.T + q1@k1.T → [QUERY_LEN, BLOCK_SIZE]
-        scores = (tl.dot(q0, tl.trans(k0), out_dtype=tl.float32)
-                + tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)) * scale
-        scores = tl.where(offs_l[None, :] < valid, scores, float("-inf"))
+        # V: [BLOCK_SIZE, HEAD_DIM]
+        v = tl.load(kv_base
+                    + offs_l[:, None] * kv_stride_l
+                    + (HEAD_DIM + offs_d[None, :]) * kv_stride_c,
+                    mask=offs_l[:, None] < valid,
+                    other=0.0).to(tl.float32)
 
-        # Online softmax
-        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        # Q·K^T via element-wise + sum — avoids tl.dot MMA SMEM tiles
+        # q: [HEAD_DIM], k: [BLOCK_SIZE, HEAD_DIM]
+        # scores[l] = sum_d(q[d] * k[l, d])
+        scores = tl.sum(q[None, :] * k, axis=1) * scale  # [BLOCK_SIZE]
+        scores = tl.where(offs_l < valid, scores, float("-inf"))
+
+        # Online softmax update
+        m_new = tl.max(tl.maximum(m, scores), axis=0)   # scalar
         alpha = tl.exp(m - m_new)
-        exp_s = tl.exp(scores - m_new[:, None]).to(tl.float16)   # [QUERY_LEN, BLOCK_SIZE]
+        exp_s = tl.exp(scores - m_new)                  # [BLOCK_SIZE]
 
-        # V chunk 0: [BLOCK_SIZE, CHUNK_D]
-        v0 = tl.load(kv_base
-                     + offs_l[:, None] * kv_stride_l
-                     + (HEAD_DIM + offs_c[None, :]) * kv_stride_c,
-                     mask=offs_l[:, None] < valid,
-                     other=0.0).to(tl.float16)
-        # V chunk 1: [BLOCK_SIZE, CHUNK_D]
-        v1 = tl.load(kv_base
-                     + offs_l[:, None] * kv_stride_l
-                     + (HEAD_DIM + CHUNK_D + offs_c[None, :]) * kv_stride_c,
-                     mask=offs_l[:, None] < valid,
-                     other=0.0).to(tl.float16)
-
-        acc0 = acc0 * alpha[:, None] + tl.dot(exp_s, v0, out_dtype=tl.float32)
-        acc1 = acc1 * alpha[:, None] + tl.dot(exp_s, v1, out_dtype=tl.float32)
-        l    = l    * alpha          + tl.sum(exp_s.to(tl.float32), axis=1)
-        m    = m_new
+        # acc += sum_l(exp_s[l] * v[l, :]) — element-wise, no tl.dot
+        acc = acc * alpha + tl.sum(exp_s[:, None] * v, axis=0)  # [HEAD_DIM]
+        l   = l   * alpha + tl.sum(exp_s,            axis=0)    # scalar
+        m   = m_new
 
     # ── Normalize and store ───────────────────────────────────────────────────
-    inv_l = (1.0 / l).to(tl.float32)
-    out0 = (acc0 * inv_l[:, None]).to(Out.dtype.element_ty)
-    out1 = (acc1 * inv_l[:, None]).to(Out.dtype.element_ty)
-
+    out = (acc / l).to(Out.dtype.element_ty)
     tl.store(Out
-             + (q_base + offs_t[:, None]) * o_stride_t
-             + q_head * o_stride_h
-             + offs_c[None, :] * o_stride_d,
-             out0)
-    tl.store(Out
-             + (q_base + offs_t[:, None]) * o_stride_t
-             + q_head * o_stride_h
-             + (CHUNK_D + offs_c[None, :]) * o_stride_d,
-             out1)
+             + tok_idx * o_stride_t
+             + q_head  * o_stride_h
+             + offs_d  * o_stride_d,
+             out)
 
 
 def sm75_paged_cross_attn(
@@ -147,6 +126,7 @@ def sm75_paged_cross_attn(
     """Triton paged cross-attention, CUDA-graph-safe.
 
     kv_cache must be NHD 4D: [num_blocks, nkv, block_size, 2*head_dim].
+    kv_indptr / kv_indices / kv_last_len are in-place-updated GPU tensors.
     """
     assert kv_cache.ndim == 4, (
         f"Expected NHD 4D kv_cache, got ndim={kv_cache.ndim} shape={kv_cache.shape}"
@@ -156,11 +136,9 @@ def sm75_paged_cross_attn(
     hd         = kv_cache.shape[3] // 2
     nq         = query.shape[1]
     gqa_ratio  = nq // nkv
-    chunk_d    = hd // 2   # Split HEAD_DIM into two equal halves
 
-    assert hd % 2 == 0, f"HEAD_DIM {hd} must be even for 2-chunk split"
-
-    grid = (num_reqs, nq)
+    # One program per (query_token, query_head)
+    grid = (num_reqs * query_len, nq)
 
     _nhd_paged_cross_attn_fwd[grid](
         query,    query.stride(0),    query.stride(1),    query.stride(2),
@@ -171,7 +149,6 @@ def sm75_paged_cross_attn(
         QUERY_LEN=query_len,
         BLOCK_SIZE=block_size,
         HEAD_DIM=hd,
-        CHUNK_D=chunk_d,
         GQA_RATIO=gqa_ratio,
         num_stages=1,
         num_warps=4,
