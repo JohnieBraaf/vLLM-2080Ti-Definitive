@@ -144,4 +144,6 @@ def sm75_paged_cross_attn(
         BLOCK_SIZE=block_size,
         HEAD_DIM=hd,
         GQA_RATIO=gqa_ratio,
+        num_stages=1,
+        num_warps=4,
     )
