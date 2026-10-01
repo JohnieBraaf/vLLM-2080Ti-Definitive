@@ -641,12 +641,20 @@ class DraftModelRunner:
         return bt
 
     def _get_mask_token_id(self) -> int:
-        hf_config    = self.draft_model_config.hf_config
+        hf_config     = self.draft_model_config.hf_config
         dflash_config = getattr(hf_config, "dflash_config", None) or {}
         if "mask_token_id" in dflash_config:
-            return dflash_config["mask_token_id"]
-        if hasattr(hf_config, "mask_token_id"):
-            return hf_config.mask_token_id
+            return int(dflash_config["mask_token_id"])
+        if hasattr(hf_config, "mask_token_id") and hf_config.mask_token_id is not None:
+            return int(hf_config.mask_token_id)
+        # Fallback: parse raw config dict (handles non-standard HF config classes
+        # where getattr does not expose nested dicts as attributes).
+        try:
+            dc = hf_config.to_dict().get("dflash_config", {})
+            if "mask_token_id" in dc:
+                return int(dc["mask_token_id"])
+        except Exception:
+            pass
         return 0
 
 
