@@ -4,6 +4,7 @@ import logging
 import random
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,6 +49,22 @@ def test_pin_mmap_region_clears_failed_registration(monkeypatch):
     gpu_worker.pin_mmap_region(region)
 
     runtime.cudaGetLastError.assert_called_once_with()
+    assert not region.is_pinned
+
+
+def test_pin_mmap_region_without_cuda_get_last_error(monkeypatch):
+    runtime = SimpleNamespace(cudaHostRegister=lambda *_: MagicMock(value=1))
+    runtime_library = MagicMock()
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(gpu_worker, "find_library", lambda _: "libcudart.so.13")
+    monkeypatch.setattr(gpu_worker.ctypes, "CDLL", lambda _: runtime_library)
+    region = MagicMock(rank=0, total_size_bytes=4096, is_pinned=False)
+
+    gpu_worker.pin_mmap_region(region)
+
+    runtime_library.cudaGetLastError.assert_called_once_with()
     assert not region.is_pinned
 
 
