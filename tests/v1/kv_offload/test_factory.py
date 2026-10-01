@@ -159,6 +159,13 @@ def test_cpu_spec_sizes_normalized_worker_layout():
     assert spec.num_chunks == 3
 
 
+@pytest.mark.parametrize("spec_name", ["CPUOffloadingSpec", "TieringOffloadingSpec"])
+def test_cpu_spec_rejects_staging_smaller_than_one_chunk(spec_name):
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    with pytest.raises(ValueError, match="too small for one aligned offload chunk"):
+        _create_spec(spec_name=spec_name, cpu_bytes_to_use=alignment - 1)
+
+
 def test_cpu_spec_zero_worker_bytes_produces_empty_cache():
     spec = _create_spec(worker_kv_bytes_per_block=0, world_size=4)
 

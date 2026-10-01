@@ -760,8 +760,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 kv_cache_allocation_context=kv_cache_allocation_context,
                 block_tables=self.block_tables,
             )
-        self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
+        device_kv_caches = [
+            (layer_name, cache)
+            for layer_name, cache in kv_caches_dict.items()
+            if cache.device == self.device
+        ]
+        group_id_by_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        self.kv_caches = [cache for _, cache in device_kv_caches]
+        self.kv_cache_group_ids = [
+            group_id_by_layer[layer_name] for layer_name, _ in device_kv_caches
         ]
         self.kv_cache_num_blocks = [
             self.kv_cache_config.num_blocks_of(
@@ -771,8 +782,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if layer_name in tensor.layers
                 )
             )
-            for layer_name, cache in kv_caches_dict.items()
-            if cache.device == self.device
+            for layer_name, _ in device_kv_caches
         ]
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -1229,6 +1239,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_group_ids,
             )
 
     def gather_batch_req_state(

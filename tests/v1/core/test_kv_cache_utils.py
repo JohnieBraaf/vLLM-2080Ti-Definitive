@@ -3148,6 +3148,9 @@ def test_dflash_aligned_hybrid_uses_native_draft_pages():
         isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in draft_groups
     )
     assert all(group.kv_cache_spec.block_size == 720 for group in draft_groups)
+    assert all(
+        group.kv_cache_spec.extra_retained_tokens == 0 for group in draft_groups
+    )
     assert all(group.kv_cache_spec.page_size_padded is None for group in draft_groups)
     assert all(
         group.kv_cache_spec.page_size_bytes < target_page_size for group in draft_groups
@@ -3237,6 +3240,9 @@ def test_dflash_aligned_hybrid_identifies_local_draft_layer_names():
         isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in draft_groups
     )
     assert all(group.kv_cache_spec.block_size == 720 for group in draft_groups)
+    assert all(
+        group.kv_cache_spec.extra_retained_tokens == 1440 for group in draft_groups
+    )
     assert all(group.kv_cache_spec.page_size_padded is None for group in draft_groups)
     assert all(group.is_eagle_group for group in draft_groups)
 

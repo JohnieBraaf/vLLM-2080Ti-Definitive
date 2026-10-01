@@ -61,6 +61,8 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+BlockFenceKey = int | tuple[int, int]
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -78,9 +80,9 @@ class TransferJobStatus:
     keys: set[OffloadKey]
     is_store: bool
     # Store source blocks fenced after the request finishes.
-    deferred_fence_block_ids: list[int] | None = None
+    deferred_fence_block_ids: list[BlockFenceKey] | None = None
     # Store source blocks fenced when the transfer is created.
-    fenced_block_ids: list[int] | None = None
+    fenced_block_ids: list[BlockFenceKey] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -541,6 +543,7 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(
             spec, vllm_config, kv_cache_config
         )
+        self._independent_block_pools = kv_cache_config.independent_block_pools
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -581,7 +584,7 @@ class OffloadingConnectorScheduler:
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
-        self._current_batch_allocated_block_ids: set[int] = set()
+        self._current_batch_allocated_block_ids: set[BlockFenceKey] = set()
         # if GPU prefix caching is enabled,
         # Track loaded chunks to avoid redundant loads.
         self._chunks_being_loaded: set[OffloadKey] | None = (
@@ -600,7 +603,7 @@ class OffloadingConnectorScheduler:
         # Populated only for finished requests (running-request blocks are
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
-        self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self._block_id_to_pending_jobs: dict[BlockFenceKey, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
@@ -621,7 +624,16 @@ class OffloadingConnectorScheduler:
         self._job_counter += 1
         return job_id
 
-    def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+    def _fence_key(self, group_idx: int, block_id: int) -> BlockFenceKey:
+        return (
+            (group_idx, block_id)
+            if self._independent_block_pools
+            else block_id
+        )
+
+    def _remove_pending_job(
+        self, job_id: int, block_ids: list[BlockFenceKey] | None
+    ) -> None:
         for bid in block_ids or ():
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
@@ -1106,7 +1118,9 @@ class OffloadingConnectorScheduler:
         ):
             group_blocks = blocks.blocks[group_config.group_idx]
             self._current_batch_allocated_block_ids.update(
-                block.block_id for block in group_blocks if block.block_id != 0
+                self._fence_key(group_config.group_idx, block.block_id)
+                for block in group_blocks
+                if block.block_id != 0
             )
 
             tokens_per_block = group_config.tokens_per_block
@@ -1223,10 +1237,19 @@ class OffloadingConnectorScheduler:
                     new_blocks = new_block_id_groups[group_config.group_idx]
                     for bid in new_blocks:
                         if bid != 0:
-                            self._current_batch_allocated_block_ids.add(bid)
+                            self._current_batch_allocated_block_ids.add(
+                                self._fence_key(group_config.group_idx, bid)
+                            )
 
         for copy in scheduler_output.kv_cache_block_copies or ():
-            self._current_batch_allocated_block_ids.add(copy.dst_block_id)
+            group_id = copy.group_id
+            if self._independent_block_pools:
+                assert group_id is not None
+            else:
+                group_id = 0
+            self._current_batch_allocated_block_ids.add(
+                self._fence_key(group_id, copy.dst_block_id)
+            )
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks
@@ -1244,7 +1267,10 @@ class OffloadingConnectorScheduler:
                     end = ends[i] if ends is not None else len(group_state.block_ids)
                     for j in range(start, end):
                         if (
-                            group_state.block_ids[j]
+                            self._fence_key(
+                                self.config.kv_group_configs[grp_idx].group_idx,
+                                group_state.block_ids[j],
+                            )
                             in self._current_batch_allocated_block_ids
                         ):
                             group_state.block_ids[j] = 0
@@ -1288,13 +1314,14 @@ class OffloadingConnectorScheduler:
 
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                fence_key = self._fence_key(group_idx, block_id)
+                self._block_id_to_pending_jobs.setdefault(fence_key, set()).add(job_id)
                 self._jobs[job_id] = TransferJobStatus(
                     req_id=req_id,
                     pending_count=self.config.num_workers,
                     keys={key},
                     is_store=True,
-                    fenced_block_ids=[block_id],
+                    fenced_block_ids=[fence_key],
                 )
                 group_sizes = [0] * num_groups
                 group_sizes[config_idx] = 1
@@ -1408,14 +1435,21 @@ class OffloadingConnectorScheduler:
 
             job_id = self._generate_job_id()
             req_status.transfer_jobs.add(job_id)
-            for block_id in source_blocks:
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+            fence_keys = [
+                self._fence_key(
+                    self.config.kv_group_configs[group_idx].group_idx,
+                    block_ids[group_idx],
+                )
+                for group_idx in accepted_groups
+            ]
+            for fence_key in fence_keys:
+                self._block_id_to_pending_jobs.setdefault(fence_key, set()).add(job_id)
             self._jobs[job_id] = TransferJobStatus(
                 req_id=req_id,
                 pending_count=self.config.num_workers,
                 keys=set(store_output.keys_to_store),
                 is_store=True,
-                fenced_block_ids=source_blocks,
+                fenced_block_ids=fence_keys,
             )
             store_jobs[job_id] = TransferJob(
                 req_id=req_id,
@@ -1469,6 +1503,26 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _reachable_store_boundaries(self, req: Request) -> tuple[int, ...]:
+        if self.config.retention_interval is None:
+            return ()
+        boundaries = (req.num_prompt_tokens - 1,)
+        if self._independent_block_pools and any(
+            group.is_eagle_group for group in self.config.kv_group_configs
+        ):
+            # Match the coordinator's EAGLE replay boundaries. The draft
+            # window needs the block above each boundary before it is popped.
+            block = self.config.alignment_tokens
+            assert block is not None
+            resend = (req.num_prompt_tokens - 1) // block * block
+            extension = req.num_prompt_tokens // block * block
+            boundaries = tuple(
+                sorted({max(resend - block, 0), max(extension - block, 0)})
+            )
+        if req.shared_prefix_boundary:
+            boundaries += (req.shared_prefix_boundary,)
+        return boundaries
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1507,11 +1561,7 @@ class OffloadingConnectorScheduler:
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
 
-            reachable_boundaries: tuple[int, ...] = ()
-            if self.config.retention_interval is not None:
-                reachable_boundaries = (req.num_prompt_tokens - 1,)
-                if req.shared_prefix_boundary:
-                    reachable_boundaries += (req.shared_prefix_boundary,)
+            reachable_boundaries = self._reachable_store_boundaries(req)
 
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
@@ -1652,8 +1702,8 @@ class OffloadingConnectorScheduler:
             group_sizes: list[int] = []
             block_indices: list[int] = []
             src_block_ids: list[int] = []
-            fenced_block_ids: list[int] = []
-            deferred_fence_block_ids: list[int] = []
+            fenced_block_ids: list[BlockFenceKey] = []
+            deferred_fence_block_ids: list[BlockFenceKey] = []
             for group_config, group_state, store_range in zip(
                 self.config.kv_group_configs,
                 req_status.group_states,
@@ -1687,10 +1737,11 @@ class OffloadingConnectorScheduler:
                             start_gpu_block_idx = gpu_block_idx + i
                         src_block_ids.append(block_id)
                         num_group_blocks += 1
+                        fence_key = self._fence_key(group_config.group_idx, block_id)
                         if is_sliding_window:
-                            fenced_block_ids.append(block_id)
+                            fenced_block_ids.append(fence_key)
                         else:
-                            deferred_fence_block_ids.append(block_id)
+                            deferred_fence_block_ids.append(fence_key)
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)

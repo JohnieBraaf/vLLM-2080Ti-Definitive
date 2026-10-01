@@ -882,6 +882,8 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   TOOL_CALL_PARSER
   TOOL_PARSER_PLUGIN
   ENABLE_PREFIX_CACHING
+  KV_DISK_CACHE_DIR
+  KV_DISK_CPU_BYTES
   ENABLE_YARN
   ENABLE_PROMPT_TOKENS_DETAILS
   DISABLE_PREFIX_CACHING
@@ -1373,6 +1375,8 @@ save_manager_state() {
     printf 'KV_CACHE_DTYPE=%q\n' "${KV_CACHE_DTYPE:-}"
     printf 'MAMBA_CACHE_MODE=%q\n' "${MAMBA_CACHE_MODE:-}"
     printf 'ENABLE_PREFIX_CACHING=%q\n' "${ENABLE_PREFIX_CACHING:-1}"
+    printf 'KV_DISK_CACHE_DIR=%q\n' "${KV_DISK_CACHE_DIR:-}"
+    printf 'KV_DISK_CPU_BYTES=%q\n' "${KV_DISK_CPU_BYTES:-}"
     printf 'ENABLE_PROMPT_TOKENS_DETAILS=%q\n' "${ENABLE_PROMPT_TOKENS_DETAILS:-1}"
     printf 'MAX_MODEL_LEN=%q\n' "${MAX_MODEL_LEN:-}"
     printf 'GPU_UTIL=%q\n' "${GPU_UTIL:-}"
@@ -1738,6 +1742,67 @@ current_prefix_cache_label() {
   else
     printf 'auto'
   fi
+}
+
+validate_disk_kv_cache_config() {
+  [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
+  if [[ "$KV_DISK_CACHE_DIR" != /* ]]; then
+    echo "ERROR: KV_DISK_CACHE_DIR must be an absolute path." >&2
+    return 1
+  fi
+  if [[ ! "${KV_DISK_CPU_BYTES:-}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: KV_DISK_CPU_BYTES must be a positive byte count." >&2
+    return 1
+  fi
+  if [[ "${DISABLE_PREFIX_CACHING:-0}" == "1" || "${ENABLE_PREFIX_CACHING:-1}" != "1" ]]; then
+    echo "ERROR: Disk KV cache requires prefix caching to be enabled." >&2
+    return 1
+  fi
+  if [[ "${PYTHONHASHSEED:-0}" != "0" ]]; then
+    echo "ERROR: Disk KV cache requires PYTHONHASHSEED=0 across restarts." >&2
+    return 1
+  fi
+}
+
+disk_kv_transfer_config() {
+  if [[ -z "${DISK_KV_CHECKPOINT_FINGERPRINT:-}" ]]; then
+    echo "ERROR: Disk KV cache checkpoint fingerprint is missing." >&2
+    return 1
+  fi
+  python3 - "$KV_DISK_CACHE_DIR" "$KV_DISK_CPU_BYTES" "$DISK_KV_CHECKPOINT_FINGERPRINT" <<'PY'
+import json
+import os
+import sys
+
+root_dir, cpu_bytes, fingerprint = sys.argv[1:]
+print(json.dumps({
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "cpu_bytes_to_use": int(cpu_bytes),
+        "spec_name": "TieringOffloadingSpec",
+        "secondary_tiers": [{
+            "type": "fs",
+            "root_dir": os.path.join(root_dir, f"checkpoint-{fingerprint}"),
+        }],
+    },
+}, separators=(",", ":")))
+PY
+}
+
+prepare_disk_kv_checkpoint_fingerprint() {
+  DISK_KV_CHECKPOINT_FINGERPRINT=""
+  [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
+
+  local method draft_checkpoint=""
+  method=$(effective_speculative_method)
+  if [[ "$method" != none && "$method" != mtp && -n "$method" ]]; then
+    draft_checkpoint=$(effective_speculative_model)
+  fi
+  DISK_KV_CHECKPOINT_FINGERPRINT=$(
+    python3 "$PROJECT_ROOT/tools/checkpoint_fingerprint.py" \
+      "$MODEL_DIR" "$draft_checkpoint"
+  ) || return 1
 }
 
 current_tq_diagnostics_label() {
@@ -3285,6 +3350,11 @@ edit_advanced_parameters() {
   NO_ASYNC_SCHEDULING=$(prompt_toggle01 "No async scheduling" "${NO_ASYNC_SCHEDULING:-0}") || return 0
   DISABLE_HYBRID_KV_CACHE_MANAGER=$(prompt_toggle01 "Disable hybrid KV cache manager" "${DISABLE_HYBRID_KV_CACHE_MANAGER:-0}") || return 0
   DISABLE_PREFIX_CACHING=$(prompt_toggle01 "Disable prefix caching" "${DISABLE_PREFIX_CACHING:-0}") || return 0
+  if [[ "$DISABLE_PREFIX_CACHING" == "1" ]]; then
+    ENABLE_PREFIX_CACHING=0
+    KV_DISK_CACHE_DIR=""
+    KV_DISK_CPU_BYTES=""
+  fi
   CUSTOM_ALL_REDUCE_MODE=$(prompt_optional "Custom all-reduce mode (auto/off)" "${CUSTOM_ALL_REDUCE_MODE:-auto}") || return 0
   unset DISABLE_CUSTOM_ALL_REDUCE
   DISABLE_LOG_STATS=$(prompt_toggle01 "Disable log stats" "${DISABLE_LOG_STATS:-0}") || return 0
@@ -3386,6 +3456,8 @@ edit_prefix_cache_menu() {
     disabled)
       DISABLE_PREFIX_CACHING=1
       ENABLE_PREFIX_CACHING=0
+      KV_DISK_CACHE_DIR=""
+      KV_DISK_CPU_BYTES=""
       ;;
     *)
       ENABLE_PREFIX_CACHING=1
@@ -3393,6 +3465,26 @@ edit_prefix_cache_menu() {
       ENABLE_PROMPT_TOKENS_DETAILS=1
       ;;
   esac
+  save_manager_state
+}
+
+edit_disk_kv_cache_menu() {
+  local choice dir cpu_bytes
+  local current=disabled
+  [[ -n "${KV_DISK_CACHE_DIR:-}" ]] && current=enabled
+  choice=$(menu_select "Disk KV cache" "$current" disabled enabled) || return 0
+  if [[ "$choice" == enabled ]]; then
+    dir=$(prompt_default "SSD cache directory" "${KV_DISK_CACHE_DIR:-/mnt/nvme/vllm-kv-cache}") || return 0
+    cpu_bytes=$(prompt_default "CPU staging bytes" "${KV_DISK_CPU_BYTES:-4294967296}") || return 0
+    if ! KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes validate_disk_kv_cache_config; then
+      return 1
+    fi
+    KV_DISK_CACHE_DIR=$dir
+    KV_DISK_CPU_BYTES=$cpu_bytes
+  else
+    KV_DISK_CACHE_DIR=""
+    KV_DISK_CPU_BYTES=""
+  fi
   save_manager_state
 }
 
@@ -3521,7 +3613,7 @@ runtime_parameter_menu() {
   local model_family_value model_variant_value served_name_value
   local quantization_value kv_value context_value gpu_util_value
   local batch_tokens_value max_sequences_value spec_decode_value spec_metrics_value message_type_value
-  local template_value reasoning_value tool_calling_value prefix_cache_value
+  local template_value reasoning_value tool_calling_value prefix_cache_value disk_kv_value
   local ple_placement_value
 
   while true; do
@@ -3541,6 +3633,7 @@ runtime_parameter_menu() {
     reasoning_value=$(menu_value "$(current_reasoning_label)")
     tool_calling_value=$(menu_value "$(current_tool_calling_label)")
     prefix_cache_value=$(menu_value "$(current_prefix_cache_label)")
+    disk_kv_value=$(menu_value "${KV_DISK_CACHE_DIR:-disabled}")
 
     if is_tty; then
       clear >/dev/tty 2>/dev/null || true
@@ -3565,6 +3658,7 @@ runtime_parameter_menu() {
       "Reasoning defaults: $reasoning_value"
       "Tool calling: $tool_calling_value"
       "Prefix cache: $prefix_cache_value"
+      "Disk KV cache: $disk_kv_value"
       "Advanced options"
       "Edit all fields"
       "Return"
@@ -3627,6 +3721,9 @@ runtime_parameter_menu() {
         ;;
       "Prefix cache:"*)
         edit_prefix_cache_menu
+        ;;
+      "Disk KV cache:"*)
+        edit_disk_kv_cache_menu
         ;;
       "Advanced options")
         edit_advanced_parameters || continue
@@ -4542,6 +4639,9 @@ set_sm75_runtime_env() {
   HF_ROUTE_MODE_ACTIVE=""
   export STABLE_ROOT="$RUNTIME_ROOT"
   export HOME=${RUN_HOME:-"$HOME"}
+  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+    export PYTHONHASHSEED=0
+  fi
   if [[ -z "${CUDA_HOME:-}" ]]; then
     runtime_cuda_version=$(
       "$RUNTIME_ROOT/.venv/bin/python" -c \
@@ -4699,6 +4799,9 @@ build_args() {
     VLLM_ARGS+=(--no-enable-prefix-caching)
   elif [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
     VLLM_ARGS+=(--enable-prefix-caching)
+  fi
+  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+    VLLM_ARGS+=(--kv-transfer-config "$(disk_kv_transfer_config)")
   fi
   [[ "${ENABLE_PROMPT_TOKENS_DETAILS:-1}" == "1" ]] && VLLM_ARGS+=(--enable-prompt-tokens-details)
   [[ "${LANGUAGE_MODEL_ONLY:-0}" == "1" ]] && VLLM_ARGS+=(--language-model-only)
@@ -5404,6 +5507,14 @@ launch_server() {
     return 0
   fi
 
+  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+    mkdir -p -- "$KV_DISK_CACHE_DIR" || return 1
+    if [[ ! -w "$KV_DISK_CACHE_DIR" || ! -x "$KV_DISK_CACHE_DIR" ]]; then
+      echo "ERROR: Disk KV cache directory must be writable and searchable: $KV_DISK_CACHE_DIR" >&2
+      return 1
+    fi
+  fi
+
   configure_dflash_download_route || return 1
   [[ -n "${HF_ACTIVE_ENDPOINT:-}" ]] && server_env+=("HF_ENDPOINT=$HF_ACTIVE_ENDPOINT")
   check_checkpoint_mmap_policy || return 1
@@ -5758,6 +5869,7 @@ prepare_runtime_defaults() {
   derive_yarn_overrides || return 1
   apply_speculative_runtime_defaults
   apply_prefix_cache_defaults
+  validate_disk_kv_cache_config || return 1
   ENABLE_AUTO_TOOL_CHOICE=$(normalize_bool "${ENABLE_AUTO_TOOL_CHOICE:-0}")
   apply_family_reasoning_defaults
   if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
@@ -5771,6 +5883,7 @@ prepare_runtime_defaults() {
   validate_mode_kv_policy
   validate_spec_decode_metrics
   validate_speculative_route || return 1
+  prepare_disk_kv_checkpoint_fingerprint || return 1
 }
 
 collect_config_env() {
@@ -5804,6 +5917,10 @@ Launch summary:
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
   TQ diagnostics:       $(current_tq_diagnostics_label)
   Prefix cache:         $(current_prefix_cache_label)
+  Disk KV cache:        ${KV_DISK_CACHE_DIR:-disabled}
+  Checkpoint fingerprint: $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$DISK_KV_CHECKPOINT_FINGERPRINT" || printf 'n/a')
+  CPU staging bytes:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$KV_DISK_CPU_BYTES" || printf 'n/a')
+  Disk KV hash seed:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "${PYTHONHASHSEED:-0}" || printf 'n/a')
   Custom all-reduce:    $(current_custom_all_reduce_label)
   Mamba cache mode:     ${MAMBA_CACHE_MODE:-auto}
   Context tokens:       $MAX_MODEL_LEN

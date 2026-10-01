@@ -44,6 +44,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
     KVCacheBlock,
+    KVCacheBlockCopy,
     get_block_hash,
     get_group_id,
     get_request_block_hasher,
@@ -683,6 +684,30 @@ def test_hisparse_deferred_free_retains_host_blocks_until_fence():
     manager.block_pool.free_blocks(reversed(blocks))
     assert host_pool.get_num_free_blocks() == host_free
     assert manager.block_pool.get_num_free_blocks() == device_free
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_cow_copies_keep_group_identity_for_independent_pools(independent):
+    manager = object.__new__(KVCacheManager)
+    manager.kv_cache_config = SimpleNamespace(independent_block_pools=independent)
+    source = SimpleNamespace(block_id=1)
+    target = SimpleNamespace(block_id=2)
+    draft_source = SimpleNamespace(block_id=1)
+    draft_target = SimpleNamespace(block_id=2)
+    group_managers = [MagicMock(kv_cache_group_id=i) for i in range(2)]
+    group_managers[0].take_pending_cow_copies.return_value = [(source, target)]
+    group_managers[1].take_pending_cow_copies.return_value = [
+        (draft_source, draft_target)
+    ]
+    manager.coordinator = SimpleNamespace(single_type_managers=group_managers)
+
+    copies, retained = manager.take_kv_cache_block_copies()
+
+    assert copies == [
+        KVCacheBlockCopy(1, 2, group_id=0 if independent else None),
+        KVCacheBlockCopy(1, 2, group_id=1 if independent else None),
+    ]
+    assert retained == [source, target, draft_source, draft_target]
 
 
 def test_hisparse_host_cow_copy_is_drained_without_a_gpu_pool():

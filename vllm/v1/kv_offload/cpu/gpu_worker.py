@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import functools
 import time
 from collections import deque
 from collections.abc import Sequence
+from ctypes.util import find_library
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -203,8 +205,16 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    cudart = torch.cuda.cudart()
+    result = cudart.cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
+        # PyTorch's CUDA 13 binding omits cudaGetLastError. Clear the runtime
+        # error through libcudart before the next torch allocation.
+        clear_error = getattr(cudart, "cudaGetLastError", None)
+        if clear_error is not None:
+            clear_error()
+        elif current_platform.is_cuda():
+            ctypes.CDLL(find_library("cudart") or "libcudart.so").cudaGetLastError()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",

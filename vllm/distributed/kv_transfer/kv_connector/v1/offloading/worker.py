@@ -82,9 +82,13 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
-        for kv_cache_group in selected_groups:
+        for group_id, kv_cache_group in zip(selected_group_ids, selected_groups):
             assert not kv_cache_group.host_resident
-            num_blocks = kv_cache_config.num_blocks
+            num_blocks = (
+                kv_cache_config.num_blocks_per_group[group_id]
+                if kv_cache_config.num_blocks_per_group is not None
+                else kv_cache_config.num_blocks
+            )
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
