@@ -2610,6 +2610,7 @@ class FlashInferImpl(AttentionImpl):
                             and hasattr(prefill_wrapper, '_sm75_kv_indptr_gpu')
                             and kv_cache.ndim == 4
                             and kv_cache.shape[2] <= 16
+                            and (key is None or key.shape[0] == 0)
                         ):
                             from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
                                 sm75_paged_cross_attn,
