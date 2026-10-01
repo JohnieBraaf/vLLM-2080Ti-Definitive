@@ -654,16 +654,21 @@ class DFlashQwen3Model(nn.Module):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             if self._sm75_kv_write:
-                # SM75: FlashInfer do_kv_cache_update causes Xid 13 (out-of-range addr).
-                # Use direct PyTorch advanced indexing instead.
-                # kv_cache layout: [num_blocks, num_kv_heads, page_size, 2*head_dim]
-                # where [:, :, :, :hd] = K and [:, :, :, hd:] = V
-                _bs = kv_cache.shape[2]  # page_size
-                _pi = (slot_mapping // _bs).long()
-                _po = (slot_mapping % _bs).long()
-                _hd = all_k_final[i].shape[-1]
-                kv_cache[_pi, :, _po, :_hd] = all_k_final[i]  # K
-                kv_cache[_pi, :, _po, _hd:] = all_v[i]         # V
+                if kv_cache.ndim == 5:
+                    # BLHNC layout: [num_blocks, block_size, num_kv_heads, 2, head_dim]
+                    _bs = kv_cache.shape[1]
+                    _pi = (slot_mapping // _bs).long()
+                    _po = (slot_mapping % _bs).long()
+                    kv_cache[_pi, _po, :, 0, :] = all_k_final[i]
+                    kv_cache[_pi, _po, :, 1, :] = all_v[i]
+                else:
+                    # NHD layout: [num_blocks, num_kv_heads, page_size, 2*head_dim]
+                    _bs = kv_cache.shape[2]
+                    _pi = (slot_mapping // _bs).long()
+                    _po = (slot_mapping % _bs).long()
+                    _hd = all_k_final[i].shape[-1]
+                    kv_cache[_pi, :, _po, :_hd] = all_k_final[i]
+                    kv_cache[_pi, :, _po, _hd:] = all_v[i]
             else:
                 attn.impl.do_kv_cache_update(
                     attn,

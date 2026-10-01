@@ -125,8 +125,15 @@ def _sm75_paged_prefill_sdpa(
     kv_cache layout: [num_blocks, num_kv_heads, page_size, 2*head_size]
     """
     import torch.nn.functional as F
-    num_kv_heads = kv_cache.shape[1]
     num_qo_heads = query.shape[1]
+    if kv_cache.ndim == 5:
+        # BLHNC layout: [num_blocks, block_size, num_kv_heads, 2, head_dim]
+        num_kv_heads = kv_cache.shape[2]
+        head_size = kv_cache.shape[4]
+    else:
+        # NHD layout: [num_blocks, num_kv_heads, block_size, 2*head_dim]
+        num_kv_heads = kv_cache.shape[1]
+        head_size = kv_cache.shape[-1] // 2
     gqa_ratio = num_qo_heads // num_kv_heads
     indptr = paged_kv_indptr          # CPU [B+1]
     indices = paged_kv_indices        # GPU [total_pages]
@@ -142,10 +149,16 @@ def _sm75_paged_prefill_sdpa(
             out[i * query_len:(i + 1) * query_len].zero_()
             continue
         page_idxs = indices[start:end]  # GPU [num_pages]
-        # [num_pages, nkv, page_size, 2*hd] -> [num_pages*page_size, nkv, 2*hd]
-        kv_flat = kv_cache[page_idxs].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, 2 * head_size)
-        k_ctx = kv_flat[:ctx_len, :, :head_size]   # [ctx_len, nkv, hd]
-        v_ctx = kv_flat[:ctx_len, :, head_size:]   # [ctx_len, nkv, hd]
+        if kv_cache.ndim == 5:
+            # BLHNC: [blocks, block_size, nkv, 2, hd] -> [np*bs, nkv, 2, hd]
+            kv_flat = kv_cache[page_idxs].reshape(-1, num_kv_heads, 2, head_size)
+            k_ctx = kv_flat[:ctx_len, :, 0, :].contiguous()   # [ctx_len, nkv, hd]
+            v_ctx = kv_flat[:ctx_len, :, 1, :].contiguous()   # [ctx_len, nkv, hd]
+        else:
+            # NHD: [blocks, nkv, block_size, 2*hd] -> [np*bs, nkv, 2*hd]
+            kv_flat = kv_cache[page_idxs].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, 2 * head_size)
+            k_ctx = kv_flat[:ctx_len, :, :head_size].contiguous()   # [ctx_len, nkv, hd]
+            v_ctx = kv_flat[:ctx_len, :, head_size:].contiguous()   # [ctx_len, nkv, hd]
         if gqa_ratio > 1:
             k_ctx = k_ctx.repeat_interleave(gqa_ratio, dim=1)
             v_ctx = v_ctx.repeat_interleave(gqa_ratio, dim=1)
