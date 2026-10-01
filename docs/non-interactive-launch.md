@@ -37,15 +37,18 @@ staging tier and a filesystem tier. This stores completed prefix KV blocks on
 disk without a separate cache daemon. Keep the directory on persistent storage
 and use the same model path, KV precision, block layout, and parallel settings
 after restarting. The CPU staging allocation uses host RAM; it is not GPU KV
-capacity. The disk namespace does not include a digest of the checkpoint
-weights. Clear the cache directory after replacing weights at the same path or
-changing to an incompatible runtime.
+capacity. On each launch, the launcher hashes every file in the target and
+local draft checkpoints before loading the model. The content digest selects
+a separate disk namespace, so replacing weights at the same path cannot load
+old KV. This adds one full checkpoint read to startup; old namespaces must be
+removed manually to reclaim space. Clear the cache after changing to an
+incompatible runtime. Disk caching requires local checkpoint directories.
 
 The filesystem tier does not evict old files or enforce a disk quota. Use a
 dedicated volume with sufficient free space, monitor its usage, and clear stale
 cache data while the service is stopped. `KV_DISK_CPU_BYTES` limits only host
-RAM staging. Keep the same `PYTHONHASHSEED` (default `0`) across restarts or
-previously stored prefixes will miss.
+RAM staging. The launcher fixes `PYTHONHASHSEED=0` when disk caching is enabled
+and rejects another value, so block hashes stay stable across restarts.
 
 ```bash
 ./launcher.sh \

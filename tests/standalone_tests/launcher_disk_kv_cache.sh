@@ -5,6 +5,27 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=../../launcher.sh
 source "$ROOT/launcher.sh"
 
+fixture_dir=$(mktemp -d)
+trap 'rm -rf -- "$fixture_dir"' EXIT
+MODEL_DIR="$fixture_dir/model"
+SPECULATIVE_MODEL=""
+mkdir -p "$MODEL_DIR" "$fixture_dir/draft"
+printf 'original weights\n' > "$MODEL_DIR/model.safetensors"
+printf 'draft weights\n' > "$fixture_dir/draft/model.safetensors"
+DISK_KV_CHECKPOINT_FINGERPRINT=$(
+  python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR"
+)
+original_fingerprint=$DISK_KV_CHECKPOINT_FINGERPRINT
+[[ "$(python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR")" == "$original_fingerprint" ]]
+printf 'replacement weights\n' > "$MODEL_DIR/model.safetensors"
+replacement_fingerprint=$(python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR")
+[[ "$replacement_fingerprint" != "$original_fingerprint" ]]
+draft_fingerprint=$(
+  python3 "$ROOT/tools/checkpoint_fingerprint.py" "$MODEL_DIR" "$fixture_dir/draft"
+)
+[[ "$draft_fingerprint" != "$replacement_fingerprint" ]]
+DISK_KV_CHECKPOINT_FINGERPRINT=$replacement_fingerprint
+
 KV_DISK_CACHE_DIR=/mnt/nvme/kv-cache
 KV_DISK_CPU_BYTES=4294967296
 ENABLE_PREFIX_CACHING=1
@@ -12,7 +33,7 @@ DISABLE_PREFIX_CACHING=0
 validate_disk_kv_cache_config
 
 config=$(disk_kv_transfer_config)
-python3 - "$config" <<'PY'
+python3 - "$config" "$DISK_KV_CHECKPOINT_FINGERPRINT" <<'PY'
 import json
 import sys
 
@@ -23,7 +44,10 @@ extra = config["kv_connector_extra_config"]
 assert extra["cpu_bytes_to_use"] == 4294967296
 assert extra["spec_name"] == "TieringOffloadingSpec"
 assert extra["secondary_tiers"] == [
-    {"type": "fs", "root_dir": "/mnt/nvme/kv-cache"}
+    {
+        "type": "fs",
+        "root_dir": f"/mnt/nvme/kv-cache/checkpoint-{sys.argv[2]}",
+    }
 ]
 PY
 
@@ -67,13 +91,13 @@ if validate_disk_kv_cache_config 2>/dev/null; then
   echo "unstable hash seed unexpectedly accepted" >&2
   exit 1
 fi
-for PYTHONHASHSEED in abc 4294967296; do
+for PYTHONHASHSEED in abc 4294967296 4294967295; do
   if validate_disk_kv_cache_config 2>/dev/null; then
     echo "invalid hash seed unexpectedly accepted: $PYTHONHASHSEED" >&2
     exit 1
   fi
 done
-PYTHONHASHSEED=4294967295
+PYTHONHASHSEED=0
 validate_disk_kv_cache_config
 unset PYTHONHASHSEED
 

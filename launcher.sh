@@ -1758,28 +1758,33 @@ validate_disk_kv_cache_config() {
     echo "ERROR: Disk KV cache requires prefix caching to be enabled." >&2
     return 1
   fi
-  local hash_seed=${PYTHONHASHSEED:-0}
-  if [[ ! "$hash_seed" =~ ^[0-9]+$ ]] ||
-     (( ${#hash_seed} > 10 )) ||
-     (( 10#$hash_seed > 4294967295 )); then
-    echo "ERROR: Disk KV cache requires PYTHONHASHSEED in [0, 4294967295]." >&2
+  if [[ "${PYTHONHASHSEED:-0}" != "0" ]]; then
+    echo "ERROR: Disk KV cache requires PYTHONHASHSEED=0 across restarts." >&2
     return 1
   fi
 }
 
 disk_kv_transfer_config() {
-  python3 - "$KV_DISK_CACHE_DIR" "$KV_DISK_CPU_BYTES" <<'PY'
+  if [[ -z "${DISK_KV_CHECKPOINT_FINGERPRINT:-}" ]]; then
+    echo "ERROR: Disk KV cache checkpoint fingerprint is missing." >&2
+    return 1
+  fi
+  python3 - "$KV_DISK_CACHE_DIR" "$KV_DISK_CPU_BYTES" "$DISK_KV_CHECKPOINT_FINGERPRINT" <<'PY'
 import json
+import os
 import sys
 
-root_dir, cpu_bytes = sys.argv[1:]
+root_dir, cpu_bytes, fingerprint = sys.argv[1:]
 print(json.dumps({
     "kv_connector": "OffloadingConnector",
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
         "cpu_bytes_to_use": int(cpu_bytes),
         "spec_name": "TieringOffloadingSpec",
-        "secondary_tiers": [{"type": "fs", "root_dir": root_dir}],
+        "secondary_tiers": [{
+            "type": "fs",
+            "root_dir": os.path.join(root_dir, f"checkpoint-{fingerprint}"),
+        }],
     },
 }, separators=(",", ":")))
 PY
@@ -4620,7 +4625,7 @@ set_sm75_runtime_env() {
   export STABLE_ROOT="$RUNTIME_ROOT"
   export HOME=${RUN_HOME:-"$HOME"}
   if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
-    export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
+    export PYTHONHASHSEED=0
   fi
   if [[ -z "${CUDA_HOME:-}" ]]; then
     runtime_cuda_version=$(
@@ -5863,6 +5868,16 @@ prepare_runtime_defaults() {
   validate_mode_kv_policy
   validate_spec_decode_metrics
   validate_speculative_route || return 1
+  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+    local draft_checkpoint
+    draft_checkpoint=$(effective_speculative_model)
+    DISK_KV_CHECKPOINT_FINGERPRINT=$(
+      python3 "$PROJECT_ROOT/tools/checkpoint_fingerprint.py" \
+        "$MODEL_DIR" "$draft_checkpoint"
+    ) || return 1
+  else
+    DISK_KV_CHECKPOINT_FINGERPRINT=""
+  fi
 }
 
 collect_config_env() {
@@ -5897,6 +5912,7 @@ Launch summary:
   TQ diagnostics:       $(current_tq_diagnostics_label)
   Prefix cache:         $(current_prefix_cache_label)
   Disk KV cache:        ${KV_DISK_CACHE_DIR:-disabled}
+  Checkpoint fingerprint: $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$DISK_KV_CHECKPOINT_FINGERPRINT" || printf 'n/a')
   CPU staging bytes:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$KV_DISK_CPU_BYTES" || printf 'n/a')
   Disk KV hash seed:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "${PYTHONHASHSEED:-0}" || printf 'n/a')
   Custom all-reduce:    $(current_custom_all_reduce_label)
