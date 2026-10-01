@@ -188,7 +188,7 @@ def _sm75_spec_prefill_graph_query_len(
         or vllm_config.attention_config.use_non_causal
         or envs.VLLM_BATCH_INVARIANT
         or speculative_config is None
-        or not 1 <= speculative_config.num_speculative_tokens <= 7
+        or not 1 <= speculative_config.num_speculative_tokens <= 15
         or compilation_config.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
     ):
         return None
@@ -1963,7 +1963,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 if (
                     paged_kv_indices is not None
                     and num_prefills > 0
-                    and 1 < common_attn_metadata.max_query_len <= 8
+                    and 1 < common_attn_metadata.max_query_len <= 16
                     and num_prefill_tokens
                     == common_attn_metadata.max_query_len * num_prefills
                     and current_platform.is_device_capability(75)
