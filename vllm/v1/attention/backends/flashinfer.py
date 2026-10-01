@@ -106,7 +106,12 @@ _flashinfer_workspace_buffers: dict[tuple[str, int | None], torch.Tensor] = {}
 def _sm75_paged_prefill_sdpa(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
-    prefill_meta: "FIPrefill",
+    paged_kv_indices: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    page_size: int,
+    num_reqs: int,
+    query_len: int,
     scale: float,
     out: torch.Tensor,
 ) -> None:
@@ -123,12 +128,9 @@ def _sm75_paged_prefill_sdpa(
     num_kv_heads = kv_cache.shape[1]
     num_qo_heads = query.shape[1]
     gqa_ratio = num_qo_heads // num_kv_heads
-    page_size = prefill_meta.sm75_page_size
-    num_reqs = prefill_meta.sm75_num_reqs
-    query_len = prefill_meta.sm75_query_len
-    indptr = prefill_meta.sm75_paged_kv_indptr          # CPU [B+1]
-    indices = prefill_meta.sm75_paged_kv_indices         # GPU [total_pages]
-    last_page_len = prefill_meta.sm75_paged_kv_last_page_len  # CPU [B]
+    indptr = paged_kv_indptr          # CPU [B+1]
+    indices = paged_kv_indices        # GPU [total_pages]
+    last_page_len = paged_kv_last_page_len  # CPU [B]
     head_size = kv_cache.shape[-1] // 2
     for i in range(num_reqs):
         start = int(indptr[i].item())
@@ -732,9 +734,6 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
-    sm75_paged_kv_indices: torch.Tensor | None = None
-    sm75_paged_kv_indptr: torch.Tensor | None = None
-    sm75_paged_kv_last_page_len: torch.Tensor | None = None
     sm75_page_size: int = 0
     sm75_num_reqs: int = 0
     sm75_query_len: int = 0
@@ -1948,11 +1947,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         disable_split_kv=self.disable_split_kv,
                     )
                 if use_sm75_spec_graph_wrapper:
+                    prefill_wrapper._sm75_paged_kv_indices = paged_kv_indices
+                    prefill_wrapper._sm75_paged_kv_indptr = paged_kv_indptr_prefill_cpu
+                    prefill_wrapper._sm75_paged_kv_last_page_len = paged_kv_last_page_len_prefill_cpu
                     attn_metadata.prefill = FIPrefill(
                         wrapper=prefill_wrapper,
-                        sm75_paged_kv_indices=paged_kv_indices,
-                        sm75_paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                        sm75_paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
                         sm75_page_size=self.page_size,
                         sm75_num_reqs=num_prefills,
                         sm75_query_len=self._sm75_spec_query_len,
@@ -2564,12 +2563,18 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         if (
                             isinstance(attn_metadata.prefill, FIPrefill)
-                            and attn_metadata.prefill.sm75_paged_kv_indices is not None
+                            and attn_metadata.prefill.sm75_page_size > 0
+                            and hasattr(prefill_wrapper, '_sm75_paged_kv_indices')
                         ):
                             _sm75_paged_prefill_sdpa(
                                 prefill_query,
                                 kv_cache,
-                                attn_metadata.prefill,
+                                prefill_wrapper._sm75_paged_kv_indices,
+                                prefill_wrapper._sm75_paged_kv_indptr,
+                                prefill_wrapper._sm75_paged_kv_last_page_len,
+                                attn_metadata.prefill.sm75_page_size,
+                                attn_metadata.prefill.sm75_num_reqs,
+                                attn_metadata.prefill.sm75_query_len,
                                 self.scale,
                                 out_prefill,
                             )
