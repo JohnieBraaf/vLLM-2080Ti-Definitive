@@ -103,7 +103,62 @@ trtllm_workspace_buffer = None
 _flashinfer_workspace_buffers: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
-def _sm75_spec_prefill_graph_query_len(
+def _sm75_paged_prefill_sdpa(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    prefill_meta: "FIPrefill",
+    num_kv_heads: int,
+    num_qo_heads: int,
+    scale: float,
+    out: torch.Tensor,
+) -> None:
+    """SM75 bypass: materialize paged K/V and use torch SDPA.
+
+    The FlashInfer AOT SM75 prefill cubin causes Xid 13 (out-of-range address)
+    when processing multi-query spec-decode batches.  This function replicates
+    the same attention computation using PyTorch's scaled_dot_product_attention
+    over explicitly gathered paged K/V tensors.
+
+    kv_cache layout: [num_blocks, num_kv_heads, page_size, 2*head_size]
+    """
+    import torch.nn.functional as F
+    gqa_ratio = num_qo_heads // num_kv_heads
+    page_size = prefill_meta.sm75_page_size
+    num_reqs = prefill_meta.sm75_num_reqs
+    query_len = prefill_meta.sm75_query_len
+    indptr = prefill_meta.sm75_paged_kv_indptr          # CPU [B+1]
+    indices = prefill_meta.sm75_paged_kv_indices         # GPU [total_pages]
+    last_page_len = prefill_meta.sm75_paged_kv_last_page_len  # CPU [B]
+    head_size = kv_cache.shape[-1] // 2
+    for i in range(num_reqs):
+        start = int(indptr[i].item())
+        end = int(indptr[i + 1].item())
+        num_pages = end - start
+        ctx_len = (num_pages - 1) * page_size + int(last_page_len[i].item()) if num_pages > 0 else 0
+        q_i = query[i * query_len:(i + 1) * query_len]  # [Q, nq, hd]
+        if ctx_len == 0:
+            out[i * query_len:(i + 1) * query_len].zero_()
+            continue
+        page_idxs = indices[start:end]  # GPU [num_pages]
+        # [num_pages, nkv, page_size, 2*hd] -> [num_pages*page_size, nkv, 2*hd]
+        kv_flat = kv_cache[page_idxs].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, 2 * head_size)
+        k_ctx = kv_flat[:ctx_len, :, :head_size]   # [ctx_len, nkv, hd]
+        v_ctx = kv_flat[:ctx_len, :, head_size:]   # [ctx_len, nkv, hd]
+        if gqa_ratio > 1:
+            k_ctx = k_ctx.repeat_interleave(gqa_ratio, dim=1)
+            v_ctx = v_ctx.repeat_interleave(gqa_ratio, dim=1)
+        # All context precedes all query tokens — no causal mask needed.
+        out_i = F.scaled_dot_product_attention(
+            q_i.permute(1, 0, 2).contiguous(),      # [nq, Q, hd]
+            k_ctx.permute(1, 0, 2).contiguous(),    # [nq, ctx_len, hd]
+            v_ctx.permute(1, 0, 2).contiguous(),    # [nq, ctx_len, hd]
+            scale=scale,
+            is_causal=False,
+        )  # [nq, Q, hd]
+        out[i * query_len:(i + 1) * query_len] = out_i.permute(1, 0, 2)
+
+
+
     vllm_config: VllmConfig,
     kv_cache_spec: KVCacheSpec,
 ) -> int | None:
@@ -661,6 +716,11 @@ class FlashInferBackend(AttentionBackend):
         return super().supported_kv_cache_layouts()
 
     forward_includes_kv_cache_update: bool = False
+    _sm75: bool | None = None  # lazily set on first forward; True when SM75
+
+    def _set_sm75(self, tensor: torch.Tensor) -> bool:
+        type(self)._sm75 = torch.cuda.get_device_capability(tensor.device) == (7, 5)
+        return type(self)._sm75
 
 
 @dataclass
@@ -668,6 +728,12 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    sm75_paged_kv_indices: torch.Tensor | None = None
+    sm75_paged_kv_indptr: torch.Tensor | None = None
+    sm75_paged_kv_last_page_len: torch.Tensor | None = None
+    sm75_page_size: int = 0
+    sm75_num_reqs: int = 0
+    sm75_query_len: int = 0
 
 
 @dataclass
@@ -1877,7 +1943,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+                if use_sm75_spec_graph_wrapper:
+                    attn_metadata.prefill = FIPrefill(
+                        wrapper=prefill_wrapper,
+                        sm75_paged_kv_indices=paged_kv_indices,
+                        sm75_paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        sm75_paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        sm75_page_size=self.page_size,
+                        sm75_num_reqs=num_prefills,
+                        sm75_query_len=self._sm75_spec_query_len,
+                    )
+                else:
+                    attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -2481,15 +2558,34 @@ class FlashInferImpl(AttentionImpl):
                             out=out_prefill,
                         )
                     else:
-                        prefill_wrapper.run(
-                            prefill_query,
-                            kv_cache_for_fi,
-                            q_scale=layer._q_scale_float,
-                            k_scale=layer._k_scale_float,
-                            v_scale=layer._v_scale_float,
-                            out=out_prefill,
-                            kv_cache_sf=kv_cache_sf,
-                        )
+                        if (
+                            isinstance(attn_metadata.prefill, FIPrefill)
+                            and attn_metadata.prefill.sm75_paged_kv_indices is not None
+                            and (
+                                type(self)._sm75
+                                if type(self)._sm75 is not None
+                                else self._set_sm75(query)
+                            )
+                        ):
+                            _sm75_paged_prefill_sdpa(
+                                prefill_query,
+                                kv_cache,
+                                attn_metadata.prefill,
+                                self.num_kv_heads,
+                                self.num_qo_heads,
+                                self.scale,
+                                out_prefill,
+                            )
+                        else:
+                            prefill_wrapper.run(
+                                prefill_query,
+                                kv_cache_for_fi,
+                                q_scale=layer._q_scale_float,
+                                k_scale=layer._k_scale_float,
+                                v_scale=layer._v_scale_float,
+                                out=out_prefill,
+                                kv_cache_sf=kv_cache_sf,
+                            )
 
                     if needs_fp8_out_prefill:
                         output[
