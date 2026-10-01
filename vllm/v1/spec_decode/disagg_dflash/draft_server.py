@@ -506,15 +506,13 @@ class DraftModelRunner:
             (num_query_total,), mask_token_id,
             dtype=torch.int32, device=self.device,
         )
-        # Set ALL K+1 positions to the bonus token (not just j=0).
-        # Positions 1..K use the bonus token instead of mask_token_id so that
-        # causal self-attention at each position j sees "the previous token was
-        # bonus" rather than a mask embedding — this dramatically improves
-        # acceptance rate for filler-style prompts.
+        # Override j=0 (bonus position) with the actual next-token ID.
+        # In co-located DFlash2, j=0 uses next_token_id not mask_token_id.
+        # With mask_token_id at j=0 the forward pass writes wrong K/V to the
+        # bonus slot (T_old), corrupting all mask-token attention.
         _bids = bonus_ids.to(device=self.device, dtype=torch.int32)
         for _i in range(B):
-            for _j in range(num_query_per_req):
-                input_ids[_i * num_query_per_req + _j] = int(_bids[_i].item())
+            input_ids[_i * num_query_per_req] = int(_bids[_i].item())
 
         # Positions: newly-appended token is at (context_lens[i] - 1),
         # query tokens at context_lens[i] - 1 + j for j in [0, num_query_per_req).
