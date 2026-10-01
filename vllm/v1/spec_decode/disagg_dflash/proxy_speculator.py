@@ -202,14 +202,17 @@ class DisaggDFlashProposer(BaseSpeculator):
 
         new_in_this_call: set[int] = set()
         for i, seq_id in enumerate(req_ids):
-            if seq_id not in self._active_seqs:   # new sequence
+            tok_start = int(qsl[i])
+            tok_end   = int(qsl[i + 1])
+            T_step    = tok_end - tok_start
+            # Send PREFILL for: (a) sequences we haven't seen before, OR
+            # (b) sequences still being prefilled in chunks (T_step > 1 means
+            #     this batch contains multiple tokens for this seq = prefill)
+            if seq_id not in self._active_seqs or T_step > 1:
                 new_in_this_call.add(i)
-                tok_start = int(qsl[i])
-                tok_end   = int(qsl[i + 1])
-                hs_seq    = last_hidden_states[tok_start:tok_end].cpu()
-                seq_len   = int(input_batch.seq_lens_cpu_upper_bound[i])
-                T         = tok_end - tok_start
-                pos       = torch.arange(seq_len - T, seq_len, dtype=torch.int64)
+                hs_seq  = last_hidden_states[tok_start:tok_end].cpu()
+                seq_len = int(input_batch.seq_lens_cpu_upper_bound[i])
+                pos     = torch.arange(seq_len - T_step, seq_len, dtype=torch.int64)
                 self._send_prefill(seq_id, hs_seq, pos)
 
         # Update tracking AFTER sending PREFILLs.
