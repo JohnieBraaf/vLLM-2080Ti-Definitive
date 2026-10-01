@@ -164,11 +164,16 @@ class DraftModelRunner:
             max_model_len=self.max_model_len,
             dtype=self.dtype_str,
             gpu_memory_utilization=0.01,  # we allocate KV cache ourselves
-            enforce_eager=True,
+            enforce_eager=False,
             trust_remote_code=True,
             tensor_parallel_size=1,
             kv_cache_dtype=kv_dtype,
             disable_log_stats=True,
+            compilation_config={
+                "cudagraph_mode": "FULL_AND_PIECEWISE",
+                "cudagraph_capture_sizes": [8],
+                "max_cudagraph_capture_size": 8,
+            },
             # Required for DFlash2's GDN cross-attention to use the
             # FlashQLA legacy SM75-optimised kernel instead of falling back
             # to a generic implementation that produces wrong results.
@@ -541,7 +546,10 @@ class DraftModelRunner:
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
 
         # Build block tables AFTER query slot allocation, which may extend block tables.
-        max_blk = max(len(self.seq_block_tables[sid]) for sid in seq_ids)
+        # Use a FIXED max size (max_model_len / block_size) so CUDA graph capture and
+        # replay always see the same block_table shape — dynamic sizing breaks CUDA graph.
+        max_blk = (self.vllm_config.model_config.max_model_len
+                   // self.vllm_config.cache_config.block_size)
         block_tables = self._build_block_table_tensor(seq_ids, max_blk)
 
         # query_start_loc [B+1]
