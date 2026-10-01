@@ -107,8 +107,6 @@ def _sm75_paged_prefill_sdpa(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     prefill_meta: "FIPrefill",
-    num_kv_heads: int,
-    num_qo_heads: int,
     scale: float,
     out: torch.Tensor,
 ) -> None:
@@ -122,6 +120,8 @@ def _sm75_paged_prefill_sdpa(
     kv_cache layout: [num_blocks, num_kv_heads, page_size, 2*head_size]
     """
     import torch.nn.functional as F
+    num_kv_heads = kv_cache.shape[1]
+    num_qo_heads = query.shape[1]
     gqa_ratio = num_qo_heads // num_kv_heads
     page_size = prefill_meta.sm75_page_size
     num_reqs = prefill_meta.sm75_num_reqs
@@ -2570,8 +2570,6 @@ class FlashInferImpl(AttentionImpl):
                                 prefill_query,
                                 kv_cache,
                                 attn_metadata.prefill,
-                                self.num_kv_heads,
-                                self.num_qo_heads,
                                 self.scale,
                                 out_prefill,
                             )
