@@ -6,6 +6,7 @@ import importlib.util
 import os
 import pty
 import select
+import signal
 import subprocess
 import tempfile
 import time
@@ -21,7 +22,7 @@ topology = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(topology)
 
 
-def run_tty(command, exchanges):
+def run_tty(command, exchanges, timeout=10):
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
@@ -29,9 +30,10 @@ def run_tty(command, exchanges):
         os.execv("/bin/bash", ["bash", "-c", command])
     output = b""
     search_start = 0
+    status = None
     try:
         for marker, keys in exchanges:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + timeout
             while marker.encode() not in output[search_start:]:
                 if time.monotonic() > deadline:
                     raise AssertionError(
@@ -44,13 +46,27 @@ def run_tty(command, exchanges):
                     except OSError as exc:
                         if exc.errno != errno.EIO:
                             raise
-                        break
+                        raise AssertionError(
+                            f"PTY child exited before prompt {marker}: "
+                            f"{output[-800:]!r}"
+                        ) from exc
             for key in keys:
-                os.write(master, key)
+                try:
+                    os.write(master, key)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    raise AssertionError(
+                        f"PTY child exited before key input: {output[-800:]!r}"
+                    ) from exc
                 time.sleep(0.04)
             search_start = len(output)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            waited, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = child_status
+                break
             ready, _, _ = select.select([master], [], [], 0.1)
             if ready:
                 try:
@@ -58,14 +74,30 @@ def run_tty(command, exchanges):
                 except OSError as exc:
                     if exc.errno != errno.EIO:
                         raise
-                    break
-        _, status = os.waitpid(pid, 0)
+        if status is None:
+            raise AssertionError(f"PTY child did not exit: {output[-800:]!r}")
+        while select.select([master], [], [], 0)[0]:
+            try:
+                output += os.read(master, 65536)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                break
         return output.decode(errors="replace"), os.waitstatus_to_exitcode(status)
     finally:
+        if status is None:
+            with suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(pid, 0)
         os.close(master)
 
 
 class LauncherInteractiveTest(unittest.TestCase):
+    def test_tty_runner_times_out_and_reaps_child(self):
+        with self.assertRaisesRegex(AssertionError, "did not exit"):
+            run_tty("sleep 30", [], timeout=0.2)
+
     def test_main_menu_wraps_with_split_escape_bytes(self):
         for start, arrow, expected in (
             (1, b"A", 0),
@@ -134,6 +166,19 @@ class LauncherInteractiveTest(unittest.TestCase):
             self.assertEqual(target[0], str(paths[4]))
             self.assertEqual(len(set(target)), 10)
             self.assertEqual(draft, [str(paths[0])])
+            history = Path(directory) / "model-target-history"
+            history.write_text(
+                f"{paths[4]}\n{paths[4]}\n{directory}/missing\n{paths[5]}\n"
+            )
+            subprocess.run(
+                ["bash", "-c", 'source ./launcher.sh; record_model_history target ""'],
+                cwd=ROOT,
+                env={**os.environ, "LOG_DIR": directory},
+                check=True,
+            )
+            self.assertEqual(
+                history.read_text().splitlines(), [str(paths[4]), str(paths[5])]
+            )
 
     def test_cancel_cleanup_only_stops_recorded_process(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,6 +302,11 @@ class LauncherInteractiveTest(unittest.TestCase):
     def test_topology_search_has_device_bound(self):
         with self.assertRaisesRegex(ValueError, "at most 12"):
             topology.recommend([str(index) for index in range(13)], 1, {})
+
+    def test_single_gpu_topology_header(self):
+        matrix = "\x1b[4mGPU0 CPU Affinity\x1b[0m\nGPU0 X 0-3\n"
+        result = topology.recommend(["0"], 1, topology.read_matrix(matrix))
+        self.assertEqual(result["ordered_devices"], "0")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ def read_matrix(text):
         cells = ANSI_ESCAPE.sub("", line).split()
         if not cells:
             continue
-        if header is None and all(re.fullmatch(r"GPU\d+", cell) for cell in cells[:2]):
+        if header is None and re.fullmatch(r"GPU\d+", cells[0]):
             header = []
             for cell in cells:
                 if not re.fullmatch(r"GPU\d+", cell):

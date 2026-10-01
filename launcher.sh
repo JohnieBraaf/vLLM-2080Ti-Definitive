@@ -1878,16 +1878,28 @@ model_history_file() {
 }
 
 record_model_history() {
-  local kind=$1 path=$2 file tmp entry count=1
-  [[ -d "$path" && "$path" != *$'\n'* ]] || return 0
+  local kind=$1 path=$2 file tmp entry existing duplicate count=0
+  local -a kept=()
+  [[ -d "$path" && "$path" != *$'\n'* ]] || path=""
   file=$(model_history_file "$kind") || return 1
+  [[ -n "$path" || -f "$file" ]] || return 0
   mkdir -p "$LOG_DIR"
   tmp=$(mktemp "${file}.XXXXXX") || return 1
-  printf '%s\n' "$path" > "$tmp"
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path" > "$tmp"
+    kept+=("$path")
+    count=1
+  fi
   if [[ -f "$file" ]]; then
     while IFS= read -r entry && (( count < MODEL_HISTORY_LIMIT )); do
-      [[ -n "$entry" && "$entry" != "$path" && -d "$entry" ]] || continue
+      [[ -n "$entry" && "$entry" != *$'\n'* && -d "$entry" ]] || continue
+      duplicate=0
+      for existing in "${kept[@]}"; do
+        [[ "$entry" == "$existing" ]] && { duplicate=1; break; }
+      done
+      (( duplicate == 0 )) || continue
       printf '%s\n' "$entry" >> "$tmp"
+      kept+=("$entry")
       count=$((count + 1))
     done < "$file"
   fi
