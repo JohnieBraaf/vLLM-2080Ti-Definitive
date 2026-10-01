@@ -158,7 +158,7 @@ def _sm75_paged_prefill_sdpa(
         out[i * query_len:(i + 1) * query_len] = out_i.permute(1, 0, 2)
 
 
-
+def _sm75_spec_prefill_graph_query_len(
     vllm_config: VllmConfig,
     kv_cache_spec: KVCacheSpec,
 ) -> int | None:
