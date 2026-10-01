@@ -16,6 +16,7 @@ PROFILE_DIR=${PROFILE_DIR:-"$MANAGER_ROOT/profiles"}
 TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
 LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
 STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
+MODEL_HISTORY_LIMIT=10
 STAMP=$(date +%Y%m%d-%H%M%S)
 VERSION=${VERSION:-$FORK_RELEASE}
 MTP_K=${MTP_K:-0}
@@ -1900,11 +1901,12 @@ format_tp_rank_groups() {
   local devices=${1:-}
   local tp_size=${2:-1}
   local -a parts=()
-  local index group_index=0 group="" output=""
+  local index group_index=0 pp_count group="" output=""
 
   [[ "$tp_size" =~ ^[1-9][0-9]*$ ]] || return 1
   IFS=',' read -r -a parts <<< "${devices// /}"
   ((${#parts[@]} > 0 && ${#parts[@]} % tp_size == 0)) || return 1
+  pp_count=$((${#parts[@]} / tp_size))
 
   for index in "${!parts[@]}"; do
     if [[ -n "$group" ]]; then
@@ -1914,7 +1916,11 @@ format_tp_rank_groups() {
     fi
     if (( (index + 1) % tp_size == 0 )); then
       [[ -n "$output" ]] && output+="  "
-      output+="TP${group_index}=[$group]"
+      if (( pp_count > 1 )); then
+        output+="PP${group_index}(TP${tp_size})=[$group]"
+      else
+        output+="TP0=[$group]"
+      fi
       group=""
       ((group_index += 1))
     fi
@@ -1925,13 +1931,86 @@ format_tp_rank_groups() {
 recommend_gpu_rank_order() {
   local devices=$1
   local tp_size=$2
+  local pp_size=$3
   local helper="$MANAGER_ROOT/tools/recommend_gpu_topology.py"
   local python_bin=${RUNTIME_ROOT:-$MANAGER_ROOT}/.venv/bin/python
 
   [[ -f "$helper" ]] || return 1
   [[ -x "$python_bin" ]] || python_bin=$(command -v python3 || true)
   [[ -n "$python_bin" ]] || return 1
-  "$python_bin" "$helper" --devices "$devices" --tp-size "$tp_size"
+  "$python_bin" "$helper" --devices "$devices" --tp-size "$tp_size" --pp-size "$pp_size"
+}
+
+model_history_file() {
+  case "$1" in
+    target|draft) printf '%s/model-%s-history\n' "$LOG_DIR" "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+record_model_history() {
+  local kind=$1 path=$2 file tmp entry existing duplicate count=0
+  local -a kept=()
+  [[ -d "$path" && "$path" != *$'\n'* ]] || path=""
+  file=$(model_history_file "$kind") || return 1
+  [[ -n "$path" || -f "$file" ]] || return 0
+  mkdir -p "$LOG_DIR"
+  tmp=$(mktemp "${file}.XXXXXX") || return 1
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path" > "$tmp"
+    kept+=("$path")
+    count=1
+  fi
+  if [[ -f "$file" ]]; then
+    while IFS= read -r entry && (( count < MODEL_HISTORY_LIMIT )); do
+      [[ -n "$entry" && "$entry" != *$'\n'* && -d "$entry" ]] || continue
+      duplicate=0
+      for existing in "${kept[@]}"; do
+        [[ "$entry" == "$existing" ]] && { duplicate=1; break; }
+      done
+      (( duplicate == 0 )) || continue
+      printf '%s\n' "$entry" >> "$tmp"
+      kept+=("$entry")
+      count=$((count + 1))
+    done < "$file"
+  fi
+  mv -f -- "$tmp" "$file"
+}
+
+select_model_path() {
+  local kind=$1 label=$2 default=${3:-} required=$4
+  local file entry selected
+  local -a choices=("Enter another path")
+  record_model_history "$kind" "$default" || true
+  file=$(model_history_file "$kind") || return 1
+  if [[ -f "$file" ]]; then
+    while IFS= read -r entry; do
+      [[ -n "$entry" && -d "$entry" ]] && choices+=("$entry")
+    done < "$file"
+  fi
+  if ((${#choices[@]} > 1)); then
+    [[ "$required" == 0 ]] && choices+=("Clear draft model")
+    selected=$(menu_select "$label (recent directories)" "${default:-Enter another path}" "${choices[@]}") || return 1
+    case "$selected" in
+      "Clear draft model") printf '\n'; return 0 ;;
+      "Enter another path") ;;
+      *) record_model_history "$kind" "$selected" || true; printf '%s\n' "$selected"; return 0 ;;
+    esac
+  fi
+  case "$required" in
+    1) selected=$(prompt_required_dir "$label" "$default") || return 1 ;;
+    2)
+      while true; do
+        selected=$(prompt_default "$label" "$default") || return 1
+        [[ -n "$selected" ]] && break
+        is_tty || return 1
+        echo "Draft model path or repository is required." >/dev/tty
+      done
+      ;;
+    *) selected=$(prompt_optional "$label" "$default") || return 1 ;;
+  esac
+  record_model_history "$kind" "$selected" || true
+  printf '%s\n' "$selected"
 }
 
 select_tp_pp_layout() {
@@ -1966,13 +2045,15 @@ confirm_gpu_rank_order() {
 
   recommended_devices=$selected_devices
   topology_summary="Topology probe unavailable; preserving the selected order."
-  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" 2>/dev/null); then
+  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" "$PP_SIZE" 2>&1); then
     recommended_devices=$(json_config_field "$recommendation" ordered_devices 2>/dev/null || true)
     topology_summary=$(json_config_field "$recommendation" summary 2>/dev/null || true)
     if ! gpu_device_order_matches_selection "$selected_devices" "$recommended_devices"; then
       recommended_devices=$selected_devices
       topology_summary="Topology recommendation was invalid; preserving the selected order."
     fi
+  elif [[ -n "$recommendation" ]]; then
+    topology_summary="${recommendation//$'\n'/ }; preserving the selected order."
   fi
 
   if ! is_tty; then
@@ -2125,6 +2206,14 @@ menu_select_supports_in_place_update() {
   terminal_supports_in_place_update
 }
 
+read_escape_sequence() {
+  local first second
+  IFS= read -rsn1 -t 0.3 first </dev/tty || return 1
+  [[ "$first" == '[' || "$first" == 'O' ]] || return 1
+  IFS= read -rsn1 -t 0.3 second </dev/tty || return 1
+  printf '%s%s\n' "$first" "$second"
+}
+
 update_menu_select_selection() {
   local previous=$1
   local current=$2
@@ -2241,15 +2330,15 @@ menu_select() {
       fi
 
       if [[ "$key" == $'\x1b' ]]; then
-        read -rsn2 -t 0.1 key </dev/tty || true
+        key=$(read_escape_sequence) || key=""
         if [[ -z "$key" ]]; then
           printf '\n' >/dev/tty
           return 1
         fi
         previous_idx=$idx
         case "$key" in
-          "[A") (( idx > 0 )) && idx=$((idx - 1)) ;;
-          "[B") (( idx < count - 1 )) && idx=$((idx + 1)) ;;
+          "[A"|"OA") idx=$(((idx + count - 1) % count)) ;;
+          "[B"|"OB") idx=$(((idx + 1) % count)) ;;
         esac
         if (( idx != previous_idx )); then
           if menu_select_supports_in_place_update; then
@@ -2332,15 +2421,15 @@ menu_select() {
     fi
 
     if [[ "$key" == $'\x1b' ]]; then
-      read -rsn2 -t 0.1 key </dev/tty || true
+      key=$(read_escape_sequence) || key=""
       if [[ -z "$key" ]]; then
         printf '\n' >/dev/tty
         return 1
       fi
       previous_idx=$idx
       case "$key" in
-        "[A") (( idx > 0 )) && idx=$((idx - 1)) ;;
-        "[B") (( idx < count - 1 )) && idx=$((idx + 1)) ;;
+        "[A"|"OA") idx=$(((idx + count - 1) % count)) ;;
+        "[B"|"OB") idx=$(((idx + 1) % count)) ;;
       esac
       if (( idx != previous_idx )); then
         if menu_select_supports_in_place_update; then
@@ -2955,12 +3044,12 @@ select_gpu_devices_menu() {
 
 select_weight_dir() {
   local selected draft_model
-  selected=$(prompt_required_dir "Target model checkpoint directory" "${MODEL_DIR:-}") || return 0
+  selected=$(select_model_path target "Target model checkpoint directory" "${MODEL_DIR:-}" 1) || return 0
   MODEL_DIR="$selected"
   MODEL_FAMILY=$(guess_model_family "$MODEL_DIR")
   QUANTIZATION=$(guess_quantization "$MODEL_DIR")
   SERVED_NAME=$(basename "$MODEL_DIR")
-  draft_model=$(prompt_optional "Draft model path or repo (DFlash only)" "${SPECULATIVE_MODEL:-}") || return 0
+  draft_model=$(select_model_path draft "Draft model path or repo (DFlash only)" "${SPECULATIVE_MODEL:-}" 0) || return 0
   SPECULATIVE_MODEL="$draft_model"
   save_manager_state
 }
@@ -3328,7 +3417,7 @@ edit_advanced_parameters() {
   HF_OVERRIDES_JSON=$(prompt_optional "HF overrides JSON" "${HF_OVERRIDES_JSON:-}") || return 0
   ADDITIONAL_CONFIG_JSON=$(prompt_optional "Additional config JSON" "${ADDITIONAL_CONFIG_JSON:-}") || return 0
   SPECULATIVE_METHOD=$(prompt_optional "Speculative method (empty/mtp/dflash/dflash2)" "${SPECULATIVE_METHOD:-}") || return 0
-  SPECULATIVE_MODEL=$(prompt_optional "Speculative draft model path or repo" "${SPECULATIVE_MODEL:-}") || return 0
+  SPECULATIVE_MODEL=$(select_model_path draft "Speculative draft model path or repo" "${SPECULATIVE_MODEL:-}" 0) || return 0
   SPECULATIVE_TOKENS=$(prompt_optional "Speculative tokens" "${SPECULATIVE_TOKENS:-}") || return 0
   SPECULATIVE_DRAFT_TP_SIZE=$(prompt_optional "Speculative draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
   SPECULATIVE_MAX_MODEL_LEN=$(prompt_optional "Speculative draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
@@ -3577,7 +3666,7 @@ edit_speculative_decode_menu() {
       if [[ "$default_tokens" == "0" ]]; then
         default_tokens=${SPECULATIVE_TOKENS:-7}
       fi
-      draft_model=$(prompt_default "DFlash2 draft model path or repo" "$(effective_speculative_model)") || return 0
+      draft_model=$(select_model_path draft "DFlash2 draft model path or repo" "$(effective_speculative_model)" 2) || return 0
       tokens=$(prompt_default "DFlash speculative tokens" "$default_tokens") || return 0
       draft_tp=$(prompt_optional "DFlash draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
       draft_max_model_len=$(prompt_optional "DFlash draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
@@ -3842,7 +3931,7 @@ show_launch_status() {
   echo "  Model path:   ${MODEL_DIR:-unknown}"
   echo "  GPU devices:  ${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-unknown}}"
   echo "  TP / PP:      TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-  echo "  TP groups:    $(format_tp_rank_groups "${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}" "${TP_SIZE:-1}" || true)"
+  echo "  Rank layout:  $(format_tp_rank_groups "${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}" "${TP_SIZE:-1}" || true)"
   echo "  Mode:         ${MODE:-fast}"
   echo "  Scope:        ${SERVICE_SCOPE:-local}"
   echo "  Local API:    ${LAST_API_LOCAL:-http://127.0.0.1:${PORT:-8000}/v1}"
@@ -3928,6 +4017,10 @@ clear_last_service_state() {
 stop_pid_file() {
   local pid_file=$1
   local pid descendants
+  if [[ -f "${pid_file}.token" ]]; then
+    cleanup_cancelled_launch "$pid_file"
+    return $?
+  fi
   pid=$(cat "$pid_file" 2>/dev/null || true)
   if ! pid_is_running "$pid"; then
     rm -f "$pid_file"
@@ -3944,7 +4037,7 @@ stop_pid_file() {
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
       cleanup_vllm_worker_residuals || true
-      rm -f "$pid_file"
+      rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
     sleep 0.5
@@ -3956,7 +4049,7 @@ stop_pid_file() {
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
       cleanup_vllm_worker_residuals force || true
-      rm -f "$pid_file"
+      rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
     sleep 0.5
@@ -4085,12 +4178,69 @@ cleanup_failed_launch() {
     stop_pid_tree "$pid" || true
     sleep 1
     stop_pid_tree "$pid" force || true
-    rm -f "$pid_file"
+    rm -f "$pid_file" "${pid_file}.token"
   fi
   cleanup_vllm_residuals "${PORT:-}" "${SERVED_NAME:-}" "${MODEL_DIR:-}" || true
   cleanup_vllm_worker_residuals || true
   sleep 1
   cleanup_vllm_worker_residuals force || true
+}
+
+launch_token_pids() {
+  local token=$1 entry="VLLM_LAUNCH_TOKEN=$1" environ pid
+  [[ -n "$token" ]] || return 0
+  for environ in /proc/[0-9]*/environ; do
+    pid=${environ#/proc/}
+    pid=${pid%/environ}
+    [[ "$pid" != "$$" ]] || continue
+    grep -zFxq -- "$entry" "$environ" 2>/dev/null && printf '%s\n' "$pid"
+  done
+  return 0
+}
+
+pid_is_active() {
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  [[ -n "$state" && "$state" != Z* ]]
+}
+
+managed_pid_is_active() {
+  local pid=$1 token=$2
+  pid_is_active "$pid" || return 1
+  [[ -z "$token" ]] || grep -zFxq -- "VLLM_LAUNCH_TOKEN=$token" "/proc/$pid/environ" 2>/dev/null
+}
+
+cleanup_cancelled_launch() {
+  local pid_file=$1 pid token descendants remaining attempts
+  [[ -f "$pid_file" ]] || return 0
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  token=$(cat "${pid_file}.token" 2>/dev/null || true)
+  descendants=""
+  if [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"; then
+    descendants=$(collect_descendant_pids "$pid")
+    stop_pid_tree "$pid" || true
+  fi
+  for ((attempts = 0; attempts < 10; attempts++)); do
+    remaining=$(launch_token_pids "$token")
+    [[ -n "$remaining" ]] || break
+    stop_recorded_pids "$remaining" || true
+    sleep 0.5
+  done
+  remaining=$(launch_token_pids "$token")
+  stop_recorded_pids "$remaining" force || true
+  stop_recorded_pids "$descendants" force || true
+  if [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"; then
+    stop_pid_tree "$pid" force || true
+  fi
+  sleep 0.5
+  remaining=$(launch_token_pids "$token")
+  if [[ -n "$remaining" ]] || {
+    [[ "$pid" =~ ^[0-9]+$ ]] && managed_pid_is_active "$pid" "$token"
+  }; then
+    printf 'ERROR: Startup cancellation left managed processes running; kept %s for retry.\n' "$pid_file" >&2
+    return 1
+  fi
+  rm -f "$pid_file" "${pid_file}.token"
 }
 
 stop_all_managed_services() {
@@ -5045,13 +5195,37 @@ wait_for_ready() {
       echo "Starting server... elapsed=${elapsed}s | status=$hint"
       last_notice=$elapsed
     fi
-    sleep 2
+    if startup_can_read_tty; then
+      printf '\n  Press Esc to cancel startup.\n' >/dev/tty
+      if read_startup_cancel_request; then
+        return 130
+      fi
+    else
+      sleep 2
+    fi
   done
   if is_tty; then
     render_startup_progress "$log_file" "$START_TIMEOUT" "$START_TIMEOUT" "!"
     printf 'Startup timed out after %ss.\n' "$START_TIMEOUT" >/dev/tty
   fi
   return 2
+}
+
+startup_can_read_tty() {
+  local pgid tpgid
+  [[ -t 0 && "${NON_INTERACTIVE:-0}" != 1 ]] || return 1
+  pgid=$(ps -o pgid= -p "$$" 2>/dev/null) || return 1
+  tpgid=$(ps -o tpgid= -p "$$" 2>/dev/null) || return 1
+  [[ "${pgid//[[:space:]]/}" == "${tpgid//[[:space:]]/}" ]]
+}
+
+read_startup_cancel_request() {
+  local key answer
+  IFS= read -rsn1 -t 2 key </dev/tty || return 1
+  [[ "$key" == $'\x1b' ]] || return 1
+  printf '\n' >/dev/tty
+  answer=$(read_line_with_esc "Terminate startup and stop the new service? [y/N]: ") || return 1
+  [[ "${answer,,}" == y || "${answer,,}" == yes ]]
 }
 
 cold_compile_admission_failure() {
@@ -5091,7 +5265,7 @@ run_compile_prewarm() {
   local original_len=$MAX_MODEL_LEN
   local original_name=$SERVED_NAME
   local original_pid=${CURRENT_SERVER_PID:-}
-  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0
+  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0 cleanup_rc=0 launch_token
 
   prewarm_name="${SERVED_NAME}-compile-prewarm-${prewarm_len}"
   prewarm_safe=$(printf '%s' "$prewarm_name" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_*$//')
@@ -5115,7 +5289,7 @@ run_compile_prewarm() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "Parallel layout: TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-    echo "TP rank groups: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
+    echo "TP/PP rank layout: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
     echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
     echo "============================================================"
   } > "$prewarm_log"
@@ -5125,22 +5299,32 @@ run_compile_prewarm() {
   echo "Running compile prewarm at max_model_len=$prewarm_len, then retrying the original $original_len context."
   echo "  Prewarm log: $prewarm_log"
 
+  launch_token="prewarm-$$-$STAMP-$RANDOM$RANDOM"
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+    nohup setsid env "VLLM_LAUNCH_TOKEN=$launch_token" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
   else
-    nohup "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+    nohup env "VLLM_LAUNCH_TOKEN=$launch_token" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
   fi
   CURRENT_SERVER_PID=$!
   echo "$CURRENT_SERVER_PID" > "$prewarm_pid_file"
+  echo "$launch_token" > "${prewarm_pid_file}.token"
 
   wait_for_ready "$prewarm_log" "$url_host" || ready_rc=$?
-  cleanup_failed_launch "$prewarm_pid_file" || true
+  if [[ "$ready_rc" == "130" ]]; then
+    cleanup_cancelled_launch "$prewarm_pid_file" || cleanup_rc=1
+  else
+    cleanup_failed_launch "$prewarm_pid_file" || true
+  fi
 
   MAX_MODEL_LEN=$original_len
   SERVED_NAME=$original_name
   CURRENT_SERVER_PID=$original_pid
   build_args "$host_arg"
 
+  if [[ "$ready_rc" == "130" ]]; then
+    [[ "$cleanup_rc" == 0 ]] || return 131
+    return 130
+  fi
   if [[ "$ready_rc" == "0" ]]; then
     echo "Compile prewarm: OK"
     return 0
@@ -5464,7 +5648,7 @@ maybe_run_startup_performance_test() {
 
 launch_server() {
   mkdir -p "$LOG_DIR"
-  local safe_name log_file pid_file host_arg url_host args_text
+  local safe_name log_file pid_file host_arg url_host args_text launch_token
   local -a server_env=(env)
   if [[ -z "${SERVED_NAME:-}" ]]; then
     SERVED_NAME=$(basename "$MODEL_DIR")
@@ -5534,7 +5718,7 @@ launch_server() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "Parallel layout: TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-    echo "TP rank groups: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
+    echo "TP/PP rank layout: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
@@ -5559,6 +5743,8 @@ launch_server() {
   echo "  Model: $MODEL_DIR"
   echo "  Bind: $host_arg:$PORT"
 
+  launch_token="launch-$$-$STAMP-$RANDOM$RANDOM"
+  server_env+=("VLLM_LAUNCH_TOKEN=$launch_token")
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "${server_env[@]}" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$log_file" 2>&1 &
   else
@@ -5566,11 +5752,21 @@ launch_server() {
   fi
   CURRENT_SERVER_PID=$!
   echo "$CURRENT_SERVER_PID" > "$pid_file"
+  echo "$launch_token" > "${pid_file}.token"
 
   local ready_rc=0
   wait_for_ready "$log_file" "$url_host" || ready_rc=$?
   if [[ "$ready_rc" != "0" ]]; then
     local prewarm_len retry_rc
+    if [[ "$ready_rc" == "130" ]]; then
+      echo "Startup cancelled; cleaning up server processes."
+      if ! cleanup_cancelled_launch "$pid_file"; then
+        restore_overcommit_memory || true
+        return 131
+      fi
+      restore_overcommit_memory || true
+      return 130
+    fi
     if cold_compile_admission_failure "$log_file"; then
       prewarm_len=$(cold_compile_prewarm_len "$log_file" || true)
       if [[ -n "$prewarm_len" ]]; then
@@ -5585,6 +5781,12 @@ launch_server() {
           STAMP=$old_stamp
           unset VLLM_COMPILE_PREWARM_RETRY
           return "$retry_rc"
+        else
+          retry_rc=$?
+          if [[ "$retry_rc" == "130" || "$retry_rc" == "131" ]]; then
+            restore_overcommit_memory || true
+            return "$retry_rc"
+          fi
         fi
       fi
     fi
@@ -5913,7 +6115,7 @@ Launch summary:
   W/A type:             $(guess_precision_scheme "$MODEL_DIR" "${QUANTIZATION:-}")
   GPU devices:          ${GPU_DEVICES:-$(detect_default_gpu_devices)}
   Parallel layout:      TP${TP_SIZE} x PP${PP_SIZE:-1}
-  TP rank groups:       $(format_tp_rank_groups "${GPU_DEVICES:-$(detect_default_gpu_devices)}" "$TP_SIZE")
+  TP/PP rank layout:    $(format_tp_rank_groups "${GPU_DEVICES:-$(detect_default_gpu_devices)}" "$TP_SIZE")
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
   TQ diagnostics:       $(current_tq_diagnostics_label)
   Prefix cache:         $(current_prefix_cache_label)
@@ -6167,13 +6369,15 @@ read_main_menu_choice() {
   fi
 
   if [[ "$key" == $'\x1b' ]]; then
-    read -rsn2 -t 0.1 seq </dev/tty || true
+    seq=$(read_escape_sequence) || seq=""
     if [[ -z "$seq" ]]; then
       return 1
     fi
     case "$seq" in
-      "[A")
-        if (( current > 1 )); then
+      "[A"|"OA")
+        if (( current == 0 )); then
+          current=9
+        elif (( current > 1 )); then
           current=$((current - 1))
         else
           current=0
@@ -6181,7 +6385,7 @@ read_main_menu_choice() {
         printf '__INDEX__:%s\n' "$current"
         return 0
         ;;
-      "[B")
+      "[B"|"OB")
         if (( current == 0 )); then
           current=1
         elif (( current < 9 )); then
