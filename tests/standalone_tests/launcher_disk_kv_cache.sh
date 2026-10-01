@@ -78,6 +78,8 @@ validate_disk_kv_cache_config
 unset PYTHONHASHSEED
 
 save_manager_state() { :; }
+menu_select() { printf 'enabled\n'; }
+prompt_default() { printf '%s\n' "$2"; }
 KV_DISK_CACHE_DIR=/mnt/nvme/kv-cache
 KV_DISK_CPU_BYTES=4294967296
 edit_disk_kv_cache_menu

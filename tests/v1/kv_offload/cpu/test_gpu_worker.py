@@ -59,7 +59,9 @@ def test_pin_mmap_region_without_cuda_get_last_error(monkeypatch):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
     monkeypatch.setattr(gpu_worker, "find_library", lambda _: "libcudart.so.13")
-    monkeypatch.setattr(gpu_worker.ctypes, "CDLL", lambda _: runtime_library)
+    monkeypatch.setattr(
+        gpu_worker, "ctypes", SimpleNamespace(CDLL=lambda _: runtime_library)
+    )
     region = MagicMock(rank=0, total_size_bytes=4096, is_pinned=False)
 
     gpu_worker.pin_mmap_region(region)
