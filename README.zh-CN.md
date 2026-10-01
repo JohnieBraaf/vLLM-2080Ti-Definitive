@@ -17,11 +17,11 @@ profile 和验证资料。它基于上游 vLLM；再发布派生版本时必须�
 
 ![单请求实时测速演示](docs/assets/vllmspeed_dflash.gif)
 
-当前 0.2.x 基线：`v0.2.2-post2`
+当前 0.2.x 基线：`v0.2.2-post3`
 上游基线：`b23433088b`（`v0.29.1rc0-33`）
 
-分支：[`vllm-2080ti-definitive-0.2.x`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/vllm-2080ti-definitive-0.2.x)
-版本参考：[v0.2.2-post2](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post2)
+分支：[`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
+版本参考：[v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
 版本记录：[CHANGELOG.md](CHANGELOG.md)
 
 ## 💡 为什么用 RTX 2080 Ti 做 LLM 推理？
