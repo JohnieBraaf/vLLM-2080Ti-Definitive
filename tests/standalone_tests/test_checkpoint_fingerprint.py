@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Standalone correctness checks for persistent KV checkpoint identity."""
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools import checkpoint_fingerprint
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools import checkpoint_fingerprint  # noqa: E402
 
 
 class CheckpointFingerprintTests(unittest.TestCase):
