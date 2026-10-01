@@ -29,3 +29,36 @@ The profile library is a validation matrix, not a promise that every filename
 fits every machine. Capacity and performance are promoted only after the
 external audit records startup, 4K/128, 32K/512, concurrency, and image
 correctness evidence.
+
+## Experimental SSD Prefix Cache
+
+The launcher can opt into vLLM's built-in `OffloadingConnector` with a CPU
+staging tier and a filesystem tier. This stores completed prefix KV blocks on
+disk without a separate cache daemon. Keep the directory on persistent storage
+and use the same model path, KV precision, block layout, and parallel settings
+after restarting. The CPU staging allocation uses host RAM; it is not GPU KV
+capacity.
+
+```bash
+./launcher.sh \
+  --model-dir /mnt/models/Qwen3.8-27B-AWQ-INT4 \
+  --gpu-devices 0,2,3,4 --tp-size 4 \
+  --set KV_DISK_CACHE_DIR=/mnt/nvme/vllm-kv-cache \
+  --set KV_DISK_CPU_BYTES=4294967296 \
+  --print-config
+```
+
+Remove `--print-config` to start the service. This option requires prefix
+caching and sets a stable `PYTHONHASHSEED`. Before stopping the service, wait
+for `vllm:kv_offload_tiering_active_cascade_jobs` to return to zero. Compare
+`vllm:external_prefix_cache_hits_total` and the filesystem tier's
+`vllm:kv_offload_tiering_chunk_hits_total` and
+`vllm:kv_offload_tiering_read_bytes_total` after restarting.
+
+On 4xT10 with a Qwen3.8-27B AWQ-INT4 checkpoint and FP16 KV, an identical
+1,929-token prompt recovered 1,568 tokens from SSD after a full host reboot;
+the answer matched the cold run. The FS tier reported five hits and 257 MB
+read. This route remains experimental and has no published throughput claim.
+On dual RTX 2080 Ti, the same model and FP16 KV recovered 1,568 of 1,933
+prompt tokens after the vLLM service was stopped and restarted, with the same
+answer. The dual-2080-Ti run did not include a host reboot.

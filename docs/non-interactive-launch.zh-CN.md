@@ -18,3 +18,21 @@
 可以使用 `--model-dir`、`--speculative-model`、`--profile`、`--mode`、`--gpu-devices`、`--tp-size`、`--pp-size`、`--port`、`--start-timeout` 和 `--print-config`。高级 launcher/runtime 参数使用 `--set KEY=VALUE`。不要把 Prefix Cache、Mamba cache、GPU、端口或模型路径写入 profile，验证器会拒绝这些字段。
 
 Profile 库是验证矩阵，不代表每个文件在每台机器上都能运行。只有外部审计完成启动、4K/128、32K/512、并发和图文正确性验证后，路线才会被 promote。
+
+## 实验性 SSD 前缀缓存
+
+Launcher 可以启用 vLLM 内置的 `OffloadingConnector`，通过 CPU 暂存层和文件系统层将已完成的前缀 KV 块写入磁盘，不需要常驻的独立缓存进程。目录必须位于持久化存储上；重启后保持模型路径、KV 精度、块布局和并行配置一致。CPU 暂存空间占用主机内存，不会增加 GPU KV 容量。
+
+```bash
+./launcher.sh \
+  --model-dir /mnt/models/Qwen3.8-27B-AWQ-INT4 \
+  --gpu-devices 0,2,3,4 --tp-size 4 \
+  --set KV_DISK_CACHE_DIR=/mnt/nvme/vllm-kv-cache \
+  --set KV_DISK_CPU_BYTES=4294967296 \
+  --print-config
+```
+
+去掉 `--print-config` 即可启动。启用后 launcher 会要求打开前缀缓存，并设置稳定的 `PYTHONHASHSEED`。停止服务前应等待 `vllm:kv_offload_tiering_active_cascade_jobs` 回到零。重启后可查看 `vllm:external_prefix_cache_hits_total`，以及文件系统层的 `vllm:kv_offload_tiering_chunk_hits_total`、`vllm:kv_offload_tiering_read_bytes_total`。
+
+在 4xT10、Qwen3.8-27B AWQ-INT4、FP16 KV 上，整机重启后，相同的 1,929-token 提示词从 SSD 恢复了 1,568 tokens，输出与冷启动一致。文件系统层记录了 5 次命中和约 257 MB 读取。此路线仍属实验性，暂无正式吞吐成绩。
+在双 RTX 2080 Ti 上，同模型、FP16 KV 的 1,933-token 提示词在 vLLM 服务退出并重启后命中 1,568 tokens，输出保持一致。双 2080 Ti 测试未单独进行整机重启。
