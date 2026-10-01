@@ -366,7 +366,7 @@ install_vllm_build_tools() {
 }
 
 if [[ ! -f pyproject.toml || ! -d vllm ]]; then
-  fail "Run this script from the 0.2.2-post2 source tree."
+  fail "Run this script from the 0.2.2-post3 source tree."
 fi
 
 check_primary_host() {
@@ -399,7 +399,7 @@ check_primary_host() {
   if ((${#failures[@]} > 0)); then
     printf 'Primary host checks: %s\n' "${failures[*]}"
     if [[ "$require_primary_env" == "1" && "$allow_host_mismatch" != "1" ]]; then
-      fail "Host does not match the 0.2.2-post2 target. Set ALLOW_HOST_MISMATCH=1 only for a non-target dry run."
+      fail "Host does not match the 0.2.2-post3 target. Set ALLOW_HOST_MISMATCH=1 only for a non-target dry run."
     fi
     echo "Continuing because ALLOW_HOST_MISMATCH=1 or REQUIRE_PRIMARY_ENV=0."
   else

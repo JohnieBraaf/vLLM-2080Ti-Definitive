@@ -19,11 +19,11 @@ For usage feedback, feature requests, and community discussion, join the
 
 ![Live single-request throughput demo](docs/assets/vllmspeed_dflash.gif)
 
-Current 0.2.x baseline: `v0.2.2-post2`
+Current 0.2.x baseline: `v0.2.2-post3`
 Upstream baseline: `b23433088b` (`v0.29.1rc0-33`)
 
-Branch: [`vllm-2080ti-definitive-0.2.x`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/vllm-2080ti-definitive-0.2.x)
-Release reference: [v0.2.2-post2](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post2)
+Branch: [`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
+Release reference: [v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
 Release history: [CHANGELOG.md](CHANGELOG.md)
 
 ## 💡 Why RTX 2080 Ti For LLM Inference?

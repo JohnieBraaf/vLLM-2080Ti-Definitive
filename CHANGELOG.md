@@ -2,6 +2,30 @@
 
 This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately from upstream vLLM releases.
 
+## v0.2.2-post3 - 2026-10-01
+
+Patch release following `v0.2.2-post2`.
+
+### Optional local SSD prefix KV persistence (#243)
+
+Adds experimental, opt-in prefix KV persistence on local SSD through the
+launcher, with checkpoint fingerprints and stable hashes for reuse across
+restarts. Cache recovery was validated after a host reboot on 4xT10 and after
+service restarts on dual RTX 2080 Ti MTP4 and DFlash2 routes.
+
+### Hybrid Mamba prefix-cache correctness (#241)
+
+Restricts fine-grained Mamba prefix hits to backends that can restore their
+recurrent state, including for Mooncake Store; GDN/FlashQLA uses block-aligned
+hits while FlashKDA retains supported fine-grained reuse. The growing-prefix
+reproducer passed 40/40 checks on both 4xT10 and dual RTX 2080 Ti routes.
+
+### Launcher interaction and GPU topology (#244)
+
+Adds confirmed Esc cancellation during startup, wraparound menu navigation,
+separate histories of up to 10 local target and draft directories, and
+topology-aware TP grouping and PP stage ordering with P2P checks.
+
 ## v0.2.2-post2 - 2026-09-26
 
 Patch release following `v0.2.2-post1`. This release further strengthens
