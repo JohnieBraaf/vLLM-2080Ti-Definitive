@@ -383,13 +383,19 @@ class Scheduler(SchedulerInterface):
             (
                 group.kv_cache_spec.prefill_checkpoint_alignment
                 for group in kv_cache_config.kv_cache_groups
-                if isinstance(group.kv_cache_spec, MambaSpec)
+                if (
+                    isinstance(group.kv_cache_spec, MambaSpec)
+                    and group.kv_cache_spec.supports_prefill_checkpoint
+                )
             ),
             None,
         )
         self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
             not isinstance(group.kv_cache_spec, MambaSpec)
-            or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            or (
+                group.kv_cache_spec.supports_prefill_checkpoint
+                and group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            )
             for group in kv_cache_config.kv_cache_groups
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry

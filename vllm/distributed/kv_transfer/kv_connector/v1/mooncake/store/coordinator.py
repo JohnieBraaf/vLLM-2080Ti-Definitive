@@ -457,12 +457,14 @@ def partial_hash_hits_enabled(
     dcp_world_size: int = 1,
 ) -> bool:
     """Match core's DCP-aware Mamba partial-hit condition."""
-    return any(
-        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
-        and spec.mamba_cache_mode == "align"
-        and (
-            (dcp_world_size == 1 and spec.block_size > hash_block_size)
-            or (dcp_world_size > 1 and spec.block_size >= hash_block_size)
-        )
-        for g in kv_cache_groups
+    mamba_specs = [
+        spec
+        for group in kv_cache_groups
+        if isinstance(spec := _unwrap_spec(group.kv_cache_spec), MambaSpec)
+    ]
+    return bool(mamba_specs) and all(
+        spec.mamba_cache_mode == "align"
+        and spec.supports_fine_grained_prefix_cache
+        and spec.block_size >= hash_block_size
+        for spec in mamba_specs
     )

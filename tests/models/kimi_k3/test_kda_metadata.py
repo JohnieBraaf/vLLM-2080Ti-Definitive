@@ -131,6 +131,8 @@ def _make_builder(
             prefill_checkpoint_alignment=(
                 16 if num_prefill_checkpoint_blocks > 0 else None
             ),
+            supports_prefill_checkpoint=num_prefill_checkpoint_blocks > 0,
+            supports_fine_grained_prefix_cache=num_prefill_checkpoint_blocks > 0,
         ),
         layer_names=["layer.0"],
         vllm_config=vllm_config,

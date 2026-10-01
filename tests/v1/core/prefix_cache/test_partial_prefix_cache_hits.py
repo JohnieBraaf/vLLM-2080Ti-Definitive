@@ -98,6 +98,7 @@ def make_full_mamba_manager(
     use_eagle: bool = False,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
+    supports_fine_grained_prefix_cache: bool = True,
 ):
     mamba_group = KVCacheGroupSpec(
         ["mamba"],
@@ -111,6 +112,8 @@ def make_full_mamba_manager(
             prefill_checkpoint_alignment=(
                 16 if num_prefill_checkpoint_blocks > 0 else None
             ),
+            supports_prefill_checkpoint=num_prefill_checkpoint_blocks > 0,
+            supports_fine_grained_prefix_cache=supports_fine_grained_prefix_cache,
         ),
     )
     kv_cache_config = KVCacheConfig(
@@ -142,6 +145,18 @@ def make_full_mamba_manager(
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
     )
+
+
+def test_unsupported_mamba_backend_disables_partial_hash_hits():
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=2,
+        full_block_size=4,
+        mamba_block_size=4,
+        supports_fine_grained_prefix_cache=False,
+    )
+
+    assert not manager.coordinator.enable_partial_hash_hits
 
 
 def test_dcp_fine_hit_retention_uses_hash_alignment_without_eagle():

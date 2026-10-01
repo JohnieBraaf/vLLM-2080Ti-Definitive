@@ -999,6 +999,15 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
+    # Internal prefill checkpoints are valid only when the selected Mamba
+    # backend exports a state at the requested offset.  GDN/FlashQLA does not
+    # currently implement that exporter; KDA/FlashKDA opts in explicitly.
+    supports_prefill_checkpoint: bool = False
+    # Fine-grained prefix hits require the backend to materialize a valid
+    # recurrent state at a sub-block boundary. Keep direct legacy spec
+    # construction compatible; concrete Mamba backends declare their actual
+    # capability when constructing this spec.
+    supports_fine_grained_prefix_cache: bool = True
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
@@ -1051,7 +1060,11 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_bytes * (
                 resident_state_blocks
                 + self.num_speculative_blocks
-                + self.num_prefill_checkpoint_blocks
+                + (
+                    self.num_prefill_checkpoint_blocks
+                    if self.supports_prefill_checkpoint
+                    else 0
+                )
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -1077,6 +1090,11 @@ class MambaSpec(KVCacheSpec):
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.supports_prefill_checkpoint == self.supports_prefill_checkpoint
+            and (
+                spec.supports_fine_grained_prefix_cache
+                == self.supports_fine_grained_prefix_cache
+            )
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
