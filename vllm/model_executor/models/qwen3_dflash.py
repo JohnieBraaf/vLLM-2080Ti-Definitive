@@ -652,12 +652,14 @@ class DFlashQwen3Model(nn.Module):
             if self._sm75_kv_write:
                 # SM75: FlashInfer do_kv_cache_update causes Xid 13 (out-of-range addr).
                 # Use direct PyTorch advanced indexing instead.
-                # kv_cache layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
-                _bs = kv_cache.shape[2]
+                # kv_cache layout: [num_blocks, num_kv_heads, page_size, 2*head_dim]
+                # where [:, :, :, :hd] = K and [:, :, :, hd:] = V
+                _bs = kv_cache.shape[2]  # page_size
                 _pi = (slot_mapping // _bs).long()
                 _po = (slot_mapping % _bs).long()
-                kv_cache[_pi, 0, _po] = all_k_final[i]
-                kv_cache[_pi, 1, _po] = all_v[i]
+                _hd = all_k_final[i].shape[-1]
+                kv_cache[_pi, :, _po, :_hd] = all_k_final[i]  # K
+                kv_cache[_pi, :, _po, _hd:] = all_v[i]         # V
             else:
                 attn.impl.do_kv_cache_update(
                     attn,
