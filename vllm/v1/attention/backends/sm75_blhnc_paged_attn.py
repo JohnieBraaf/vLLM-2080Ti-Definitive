@@ -112,6 +112,30 @@ def _nhd_paged_cross_attn_fwd(
              out)
 
 
+def _do_sm75_triton_warmup(
+    query_len: int, block_size: int, hd: int, nkv: int, nq: int
+) -> None:
+    """Pre-compile the SM75 Triton kernel before any CUDA graph capture.
+
+    Call this from build() — which runs OUTSIDE the capture scope — so the
+    Triton JIT compilation completes before capture_begin().  The subsequent
+    call inside forward() (inside capture) then just launches the cached
+    pre-compiled kernel, which gets properly recorded in the CUDA graph.
+    """
+    try:
+        device = torch.cuda.current_device()
+        _q = torch.zeros(query_len, nq, hd, dtype=torch.float16, device=device)
+        _kv = torch.zeros(1, nkv, block_size, 2 * hd, dtype=torch.float16, device=device)
+        _iptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        _idx = torch.tensor([0], dtype=torch.int32, device=device)
+        _llen = torch.tensor([1], dtype=torch.int32, device=device)
+        _out = torch.zeros_like(_q)
+        sm75_paged_cross_attn(_q, _kv, _iptr, _idx, _llen, 1, query_len, 1.0, _out)
+        torch.cuda.synchronize()
+    except Exception:
+        pass  # Warmup failure is non-fatal; JIT will happen at inference time.
+
+
 def sm75_paged_cross_attn(
     query:       torch.Tensor,   # [B*Q, nq, hd]
     kv_cache:    torch.Tensor,   # [num_blocks, nkv, block_size, 2*hd]  NHD 4D

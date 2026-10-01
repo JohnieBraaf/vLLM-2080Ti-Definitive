@@ -1967,7 +1967,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_prefill_tokens
                     == common_attn_metadata.max_query_len * num_prefills
                     and current_platform.is_device_capability(75)
-                    and self.page_size <= 16
                 ):
                     prefill_wrapper._sm75_kv_indptr_gpu = self.paged_kv_indptr.gpu[:num_prefills + 1]
                     prefill_wrapper._sm75_kv_indices_gpu = paged_kv_indices
@@ -1978,6 +1977,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         sm75_num_reqs=num_prefills,
                         sm75_query_len=common_attn_metadata.max_query_len,
                     )
+                    # Pre-compile the Triton kernel while outside CUDA graph capture
+                    # so that the first call inside forward() (inside capture) uses
+                    # the already-compiled kernel and gets properly recorded.
+                    if not torch.cuda.is_current_stream_capturing():
+                        _wk = (
+                            common_attn_metadata.max_query_len,
+                            self.page_size,
+                            getattr(self.kv_cache_spec, 'head_size', 128),
+                            self.num_kv_heads,
+                            self.num_qo_heads,
+                        )
+                        if not hasattr(self, '_sm75_warmed_up'):
+                            self._sm75_warmed_up = set()
+                        if _wk not in self._sm75_warmed_up:
+                            self._sm75_warmed_up.add(_wk)
+                            try:
+                                from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
+                                    _do_sm75_triton_warmup,
+                                )
+                                _do_sm75_triton_warmup(*_wk)
+                            except Exception:
+                                pass
                 else:
                     attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
