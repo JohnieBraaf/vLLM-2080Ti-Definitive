@@ -527,7 +527,7 @@ class DraftModelRunner:
         # Allocate query slots. Save the pre-query block count per sequence so
         # we can release the temporary query blocks after the forward pass.
         pre_query_counts: list[int] = []
-        query_slots = torch.zeros(num_query_total, dtype=torch.int32, device=self.device)
+        query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
             blocks   = self.seq_block_tables[seq_id]
             pre_query_counts.append(len(blocks))   # save BEFORE extending
