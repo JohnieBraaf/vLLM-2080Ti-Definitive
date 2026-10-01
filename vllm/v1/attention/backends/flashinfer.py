@@ -1967,6 +1967,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_prefill_tokens
                     == common_attn_metadata.max_query_len * num_prefills
                     and current_platform.is_device_capability(75)
+                    and self.page_size <= 16
                 ):
                     prefill_wrapper._sm75_kv_indptr_gpu = self.paged_kv_indptr.gpu[:num_prefills + 1]
                     prefill_wrapper._sm75_kv_indices_gpu = paged_kv_indices
@@ -2586,6 +2587,8 @@ class FlashInferImpl(AttentionImpl):
                             isinstance(attn_metadata.prefill, FIPrefill)
                             and attn_metadata.prefill.sm75_page_size > 0
                             and hasattr(prefill_wrapper, '_sm75_kv_indptr_gpu')
+                            and kv_cache.ndim == 4
+                            and kv_cache.shape[2] <= 16
                         ):
                             from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
                                 sm75_paged_cross_attn,
