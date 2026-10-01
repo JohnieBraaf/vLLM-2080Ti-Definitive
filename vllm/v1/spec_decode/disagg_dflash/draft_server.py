@@ -164,16 +164,11 @@ class DraftModelRunner:
             max_model_len=self.max_model_len,
             dtype=self.dtype_str,
             gpu_memory_utilization=0.01,  # we allocate KV cache ourselves
-            enforce_eager=False,
+            enforce_eager=True,
             trust_remote_code=True,
             tensor_parallel_size=1,
             kv_cache_dtype=kv_dtype,
             disable_log_stats=True,
-            compilation_config={
-                "cudagraph_mode": "FULL_AND_PIECEWISE",
-                "cudagraph_capture_sizes": [8],
-                "max_cudagraph_capture_size": 8,
-            },
             # Required for DFlash2's GDN cross-attention to use the
             # FlashQLA legacy SM75-optimised kernel instead of falling back
             # to a generic implementation that produces wrong results.
