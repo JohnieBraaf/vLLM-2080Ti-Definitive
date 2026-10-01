@@ -2565,7 +2565,6 @@ class FlashInferImpl(AttentionImpl):
                         if (
                             isinstance(attn_metadata.prefill, FIPrefill)
                             and attn_metadata.prefill.sm75_paged_kv_indices is not None
-                            and self._set_sm75(prefill_query)
                         ):
                             _sm75_paged_prefill_sdpa(
                                 prefill_query,
