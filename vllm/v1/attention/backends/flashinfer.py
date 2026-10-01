@@ -2588,9 +2588,9 @@ class FlashInferImpl(AttentionImpl):
                             and hasattr(prefill_wrapper, '_sm75_kv_indptr_gpu')
                         ):
                             from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
-                                sm75_blhnc_paged_cross_attn,
+                                sm75_paged_cross_attn,
                             )
-                            sm75_blhnc_paged_cross_attn(
+                            sm75_paged_cross_attn(
                                 prefill_query,
                                 kv_cache,
                                 prefill_wrapper._sm75_kv_indptr_gpu,
