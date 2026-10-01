@@ -37,7 +37,9 @@ staging tier and a filesystem tier. This stores completed prefix KV blocks on
 disk without a separate cache daemon. Keep the directory on persistent storage
 and use the same model path, KV precision, block layout, and parallel settings
 after restarting. The CPU staging allocation uses host RAM; it is not GPU KV
-capacity.
+capacity. The disk namespace does not include a digest of the checkpoint
+weights. Clear the cache directory after replacing weights at the same path or
+changing to an incompatible runtime.
 
 ```bash
 ./launcher.sh \
