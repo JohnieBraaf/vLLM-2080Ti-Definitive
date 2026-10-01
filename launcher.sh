@@ -1836,11 +1836,12 @@ format_tp_rank_groups() {
   local devices=${1:-}
   local tp_size=${2:-1}
   local -a parts=()
-  local index group_index=0 group="" output=""
+  local index group_index=0 pp_count group="" output=""
 
   [[ "$tp_size" =~ ^[1-9][0-9]*$ ]] || return 1
   IFS=',' read -r -a parts <<< "${devices// /}"
   ((${#parts[@]} > 0 && ${#parts[@]} % tp_size == 0)) || return 1
+  pp_count=$((${#parts[@]} / tp_size))
 
   for index in "${!parts[@]}"; do
     if [[ -n "$group" ]]; then
@@ -1850,7 +1851,11 @@ format_tp_rank_groups() {
     fi
     if (( (index + 1) % tp_size == 0 )); then
       [[ -n "$output" ]] && output+="  "
-      output+="TP${group_index}=[$group]"
+      if (( pp_count > 1 )); then
+        output+="PP${group_index}(TP${tp_size})=[$group]"
+      else
+        output+="TP0=[$group]"
+      fi
       group=""
       ((group_index += 1))
     fi
@@ -1861,13 +1866,14 @@ format_tp_rank_groups() {
 recommend_gpu_rank_order() {
   local devices=$1
   local tp_size=$2
+  local pp_size=$3
   local helper="$MANAGER_ROOT/tools/recommend_gpu_topology.py"
   local python_bin=${RUNTIME_ROOT:-$MANAGER_ROOT}/.venv/bin/python
 
   [[ -f "$helper" ]] || return 1
   [[ -x "$python_bin" ]] || python_bin=$(command -v python3 || true)
   [[ -n "$python_bin" ]] || return 1
-  "$python_bin" "$helper" --devices "$devices" --tp-size "$tp_size"
+  "$python_bin" "$helper" --devices "$devices" --tp-size "$tp_size" --pp-size "$pp_size"
 }
 
 model_history_file() {
@@ -1974,7 +1980,7 @@ confirm_gpu_rank_order() {
 
   recommended_devices=$selected_devices
   topology_summary="Topology probe unavailable; preserving the selected order."
-  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" 2>&1); then
+  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" "$PP_SIZE" 2>&1); then
     recommended_devices=$(json_config_field "$recommendation" ordered_devices 2>/dev/null || true)
     topology_summary=$(json_config_field "$recommendation" summary 2>/dev/null || true)
     if ! gpu_device_order_matches_selection "$selected_devices" "$recommended_devices"; then
@@ -3828,7 +3834,7 @@ show_launch_status() {
   echo "  Model path:   ${MODEL_DIR:-unknown}"
   echo "  GPU devices:  ${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-unknown}}"
   echo "  TP / PP:      TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-  echo "  TP groups:    $(format_tp_rank_groups "${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}" "${TP_SIZE:-1}" || true)"
+  echo "  Rank layout:  $(format_tp_rank_groups "${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}" "${TP_SIZE:-1}" || true)"
   echo "  Mode:         ${MODE:-fast}"
   echo "  Scope:        ${SERVICE_SCOPE:-local}"
   echo "  Local API:    ${LAST_API_LOCAL:-http://127.0.0.1:${PORT:-8000}/v1}"
@@ -5180,7 +5186,7 @@ run_compile_prewarm() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "Parallel layout: TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-    echo "TP rank groups: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
+    echo "TP/PP rank layout: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
     echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
     echo "============================================================"
   } > "$prewarm_log"
@@ -5601,7 +5607,7 @@ launch_server() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "Parallel layout: TP${TP_SIZE:-1} x PP${PP_SIZE:-1}"
-    echo "TP rank groups: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
+    echo "TP/PP rank layout: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
@@ -5996,7 +6002,7 @@ Launch summary:
   W/A type:             $(guess_precision_scheme "$MODEL_DIR" "${QUANTIZATION:-}")
   GPU devices:          ${GPU_DEVICES:-$(detect_default_gpu_devices)}
   Parallel layout:      TP${TP_SIZE} x PP${PP_SIZE:-1}
-  TP rank groups:       $(format_tp_rank_groups "${GPU_DEVICES:-$(detect_default_gpu_devices)}" "$TP_SIZE")
+  TP/PP rank layout:    $(format_tp_rank_groups "${GPU_DEVICES:-$(detect_default_gpu_devices)}" "$TP_SIZE")
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
   TQ diagnostics:       $(current_tq_diagnostics_label)
   Prefix cache:         $(current_prefix_cache_label)

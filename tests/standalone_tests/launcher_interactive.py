@@ -299,6 +299,79 @@ class LauncherInteractiveTest(unittest.TestCase):
         result = topology.recommend(["0", "1", "2", "3"], 2, links, p2p)
         self.assertEqual(result["ordered_devices"], "0,2,1,3")
 
+    def test_tp1_pipeline_stages_follow_fast_links(self):
+        names = [f"GPU{index}" for index in range(4)]
+        links = {
+            left: {right: "X" if left == right else "SYS" for right in names}
+            for left in names
+        }
+        for left, right in (("GPU0", "GPU2"), ("GPU2", "GPU1"), ("GPU1", "GPU3")):
+            links[left][right] = links[right][left] = "NV2"
+        result = topology.recommend(["0", "1", "2", "3"], 1, links, pp_size=4)
+        self.assertEqual(result["ordered_devices"], "0,2,1,3")
+
+    def test_equal_pipeline_links_keep_selected_order(self):
+        names = [f"GPU{index}" for index in range(4)]
+        links = {
+            left: {right: "X" if left == right else "PIX" for right in names}
+            for left in names
+        }
+        result = topology.recommend(["3", "1", "0", "2"], 1, links, pp_size=4)
+        self.assertEqual(result["ordered_devices"], "3,1,0,2")
+
+    def test_rank_layout_labels_pipeline_stages(self):
+        result = subprocess.run(
+            ["bash", "-c", 'source ./launcher.sh; format_tp_rank_groups "1,5,6,7" 2'],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "PP0(TP2)=[1,5]  PP1(TP2)=[6,7]")
+
+    def test_pipeline_stages_align_corresponding_tp_ranks(self):
+        names = [f"GPU{index}" for index in range(4)]
+        links = {
+            left: {right: "X" if left == right else "PHB" for right in names}
+            for left in names
+        }
+        p2p = {
+            left: {right: "OK" if left == right else "CNS" for right in names}
+            for left in names
+        }
+        for left, right in (("GPU0", "GPU1"), ("GPU2", "GPU3")):
+            links[left][right] = links[right][left] = "PIX"
+            p2p[left][right] = p2p[right][left] = "OK"
+        for left, right in (("GPU0", "GPU3"), ("GPU1", "GPU2")):
+            links[left][right] = links[right][left] = "NV2"
+        result = topology.recommend(["0", "1", "2", "3"], 2, links, p2p, 2)
+        self.assertEqual(result["ordered_devices"], "0,1,3,2")
+
+    def test_pipeline_stage_order_can_change_after_tp_grouping(self):
+        names = [f"GPU{index}" for index in range(6)]
+        links = {
+            left: {right: "X" if left == right else "SYS" for right in names}
+            for left in names
+        }
+        p2p = {
+            left: {right: "OK" if left == right else "CNS" for right in names}
+            for left in names
+        }
+        for left, right in (("GPU0", "GPU1"), ("GPU2", "GPU3"), ("GPU4", "GPU5")):
+            links[left][right] = links[right][left] = "PIX"
+            p2p[left][right] = p2p[right][left] = "OK"
+        for left, right in (
+            ("GPU0", "GPU4"),
+            ("GPU1", "GPU5"),
+            ("GPU4", "GPU2"),
+            ("GPU5", "GPU3"),
+        ):
+            links[left][right] = links[right][left] = "NV2"
+        result = topology.recommend(
+            [str(index) for index in range(6)], 2, links, p2p, 3
+        )
+        self.assertEqual(result["ordered_devices"], "0,1,4,5,2,3")
+
     def test_topology_search_has_device_bound(self):
         with self.assertRaisesRegex(ValueError, "at most 12"):
             topology.recommend([str(index) for index in range(13)], 1, {})
