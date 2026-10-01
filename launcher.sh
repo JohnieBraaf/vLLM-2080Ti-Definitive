@@ -16,6 +16,7 @@ PROFILE_DIR=${PROFILE_DIR:-"$MANAGER_ROOT/profiles"}
 TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
 LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
 STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
+MODEL_HISTORY_LIMIT=10
 STAMP=$(date +%Y%m%d-%H%M%S)
 VERSION=${VERSION:-$FORK_RELEASE}
 MTP_K=${MTP_K:-0}
@@ -1869,6 +1870,59 @@ recommend_gpu_rank_order() {
   "$python_bin" "$helper" --devices "$devices" --tp-size "$tp_size"
 }
 
+model_history_file() {
+  case "$1" in
+    target|draft) printf '%s/model-%s-history\n' "$LOG_DIR" "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+record_model_history() {
+  local kind=$1 path=$2 file tmp entry count=1
+  [[ -d "$path" && "$path" != *$'\n'* ]] || return 0
+  file=$(model_history_file "$kind") || return 1
+  mkdir -p "$LOG_DIR"
+  tmp=$(mktemp "${file}.XXXXXX") || return 1
+  printf '%s\n' "$path" > "$tmp"
+  if [[ -f "$file" ]]; then
+    while IFS= read -r entry && (( count < MODEL_HISTORY_LIMIT )); do
+      [[ -n "$entry" && "$entry" != "$path" && -d "$entry" ]] || continue
+      printf '%s\n' "$entry" >> "$tmp"
+      count=$((count + 1))
+    done < "$file"
+  fi
+  mv -f -- "$tmp" "$file"
+}
+
+select_model_path() {
+  local kind=$1 label=$2 default=${3:-} required=$4
+  local file entry selected
+  local -a choices=("Enter another path")
+  record_model_history "$kind" "$default" || true
+  file=$(model_history_file "$kind") || return 1
+  if [[ -f "$file" ]]; then
+    while IFS= read -r entry; do
+      [[ -n "$entry" && -d "$entry" ]] && choices+=("$entry")
+    done < "$file"
+  fi
+  if ((${#choices[@]} > 1)); then
+    [[ "$required" == 1 ]] || choices+=("Clear draft model")
+    selected=$(menu_select "$label (recent directories)" "${default:-Enter another path}" "${choices[@]}") || return 1
+    case "$selected" in
+      "Clear draft model") printf '\n'; return 0 ;;
+      "Enter another path") ;;
+      *) record_model_history "$kind" "$selected" || true; printf '%s\n' "$selected"; return 0 ;;
+    esac
+  fi
+  if [[ "$required" == 1 ]]; then
+    selected=$(prompt_required_dir "$label" "$default") || return 1
+  else
+    selected=$(prompt_optional "$label" "$default") || return 1
+  fi
+  record_model_history "$kind" "$selected" || true
+  printf '%s\n' "$selected"
+}
+
 select_tp_pp_layout() {
   local devices=$1
   local count tp pp option selected default=""
@@ -1901,13 +1955,15 @@ confirm_gpu_rank_order() {
 
   recommended_devices=$selected_devices
   topology_summary="Topology probe unavailable; preserving the selected order."
-  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" 2>/dev/null); then
+  if recommendation=$(recommend_gpu_rank_order "$selected_devices" "$TP_SIZE" 2>&1); then
     recommended_devices=$(json_config_field "$recommendation" ordered_devices 2>/dev/null || true)
     topology_summary=$(json_config_field "$recommendation" summary 2>/dev/null || true)
     if ! gpu_device_order_matches_selection "$selected_devices" "$recommended_devices"; then
       recommended_devices=$selected_devices
       topology_summary="Topology recommendation was invalid; preserving the selected order."
     fi
+  elif [[ -n "$recommendation" ]]; then
+    topology_summary="${recommendation//$'\n'/ }; preserving the selected order."
   fi
 
   if ! is_tty; then
@@ -2060,6 +2116,14 @@ menu_select_supports_in_place_update() {
   terminal_supports_in_place_update
 }
 
+read_escape_sequence() {
+  local first second
+  IFS= read -rsn1 -t 0.3 first </dev/tty || return 1
+  [[ "$first" == '[' || "$first" == 'O' ]] || return 1
+  IFS= read -rsn1 -t 0.3 second </dev/tty || return 1
+  printf '%s%s\n' "$first" "$second"
+}
+
 update_menu_select_selection() {
   local previous=$1
   local current=$2
@@ -2176,15 +2240,15 @@ menu_select() {
       fi
 
       if [[ "$key" == $'\x1b' ]]; then
-        read -rsn2 -t 0.1 key </dev/tty || true
+        key=$(read_escape_sequence) || key=""
         if [[ -z "$key" ]]; then
           printf '\n' >/dev/tty
           return 1
         fi
         previous_idx=$idx
         case "$key" in
-          "[A") (( idx > 0 )) && idx=$((idx - 1)) ;;
-          "[B") (( idx < count - 1 )) && idx=$((idx + 1)) ;;
+          "[A"|"OA") idx=$(((idx + count - 1) % count)) ;;
+          "[B"|"OB") idx=$(((idx + 1) % count)) ;;
         esac
         if (( idx != previous_idx )); then
           if menu_select_supports_in_place_update; then
@@ -2267,15 +2331,15 @@ menu_select() {
     fi
 
     if [[ "$key" == $'\x1b' ]]; then
-      read -rsn2 -t 0.1 key </dev/tty || true
+      key=$(read_escape_sequence) || key=""
       if [[ -z "$key" ]]; then
         printf '\n' >/dev/tty
         return 1
       fi
       previous_idx=$idx
       case "$key" in
-        "[A") (( idx > 0 )) && idx=$((idx - 1)) ;;
-        "[B") (( idx < count - 1 )) && idx=$((idx + 1)) ;;
+        "[A"|"OA") idx=$(((idx + count - 1) % count)) ;;
+        "[B"|"OB") idx=$(((idx + 1) % count)) ;;
       esac
       if (( idx != previous_idx )); then
         if menu_select_supports_in_place_update; then
@@ -2890,12 +2954,12 @@ select_gpu_devices_menu() {
 
 select_weight_dir() {
   local selected draft_model
-  selected=$(prompt_required_dir "Target model checkpoint directory" "${MODEL_DIR:-}") || return 0
+  selected=$(select_model_path target "Target model checkpoint directory" "${MODEL_DIR:-}" 1) || return 0
   MODEL_DIR="$selected"
   MODEL_FAMILY=$(guess_model_family "$MODEL_DIR")
   QUANTIZATION=$(guess_quantization "$MODEL_DIR")
   SERVED_NAME=$(basename "$MODEL_DIR")
-  draft_model=$(prompt_optional "Draft model path or repo (DFlash only)" "${SPECULATIVE_MODEL:-}") || return 0
+  draft_model=$(select_model_path draft "Draft model path or repo (DFlash only)" "${SPECULATIVE_MODEL:-}" 0) || return 0
   SPECULATIVE_MODEL="$draft_model"
   save_manager_state
 }
@@ -3263,7 +3327,7 @@ edit_advanced_parameters() {
   HF_OVERRIDES_JSON=$(prompt_optional "HF overrides JSON" "${HF_OVERRIDES_JSON:-}") || return 0
   ADDITIONAL_CONFIG_JSON=$(prompt_optional "Additional config JSON" "${ADDITIONAL_CONFIG_JSON:-}") || return 0
   SPECULATIVE_METHOD=$(prompt_optional "Speculative method (empty/mtp/dflash/dflash2)" "${SPECULATIVE_METHOD:-}") || return 0
-  SPECULATIVE_MODEL=$(prompt_optional "Speculative draft model path or repo" "${SPECULATIVE_MODEL:-}") || return 0
+  SPECULATIVE_MODEL=$(select_model_path draft "Speculative draft model path or repo" "${SPECULATIVE_MODEL:-}" 0) || return 0
   SPECULATIVE_TOKENS=$(prompt_optional "Speculative tokens" "${SPECULATIVE_TOKENS:-}") || return 0
   SPECULATIVE_DRAFT_TP_SIZE=$(prompt_optional "Speculative draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
   SPECULATIVE_MAX_MODEL_LEN=$(prompt_optional "Speculative draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
@@ -3485,7 +3549,7 @@ edit_speculative_decode_menu() {
       if [[ "$default_tokens" == "0" ]]; then
         default_tokens=${SPECULATIVE_TOKENS:-7}
       fi
-      draft_model=$(prompt_default "DFlash2 draft model path or repo" "$(effective_speculative_model)") || return 0
+      draft_model=$(select_model_path draft "DFlash2 draft model path or repo" "$(effective_speculative_model)" 0) || return 0
       tokens=$(prompt_default "DFlash speculative tokens" "$default_tokens") || return 0
       draft_tp=$(prompt_optional "DFlash draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
       draft_max_model_len=$(prompt_optional "DFlash draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
@@ -3994,6 +4058,20 @@ cleanup_failed_launch() {
   cleanup_vllm_worker_residuals || true
   sleep 1
   cleanup_vllm_worker_residuals force || true
+}
+
+cleanup_cancelled_launch() {
+  local pid_file=$1 pid descendants
+  [[ -f "$pid_file" ]] || return 0
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$pid_file"; return 0; }
+  descendants=$(collect_descendant_pids "$pid")
+  stop_pid_tree "$pid" || true
+  wait_recorded_pids_stopped "$pid" 10 || true
+  stop_pid_tree "$pid" force || true
+  stop_recorded_pids "$descendants" force || true
+  wait_recorded_pids_stopped "$descendants" 10 || true
+  rm -f "$pid_file"
 }
 
 stop_all_managed_services() {
@@ -4942,13 +5020,29 @@ wait_for_ready() {
       echo "Starting server... elapsed=${elapsed}s | status=$hint"
       last_notice=$elapsed
     fi
-    sleep 2
+    if is_tty; then
+      printf '\n  Press Esc to cancel startup.\n' >/dev/tty
+      if read_startup_cancel_request; then
+        return 130
+      fi
+    else
+      sleep 2
+    fi
   done
   if is_tty; then
     render_startup_progress "$log_file" "$START_TIMEOUT" "$START_TIMEOUT" "!"
     printf 'Startup timed out after %ss.\n' "$START_TIMEOUT" >/dev/tty
   fi
   return 2
+}
+
+read_startup_cancel_request() {
+  local key answer
+  IFS= read -rsn1 -t 2 key </dev/tty || return 1
+  [[ "$key" == $'\x1b' ]] || return 1
+  printf '\n' >/dev/tty
+  answer=$(read_line_with_esc "Terminate startup and stop the new service? [y/N]: ") || return 1
+  [[ "${answer,,}" == y || "${answer,,}" == yes ]]
 }
 
 cold_compile_admission_failure() {
@@ -5031,13 +5125,20 @@ run_compile_prewarm() {
   echo "$CURRENT_SERVER_PID" > "$prewarm_pid_file"
 
   wait_for_ready "$prewarm_log" "$url_host" || ready_rc=$?
-  cleanup_failed_launch "$prewarm_pid_file" || true
+  if [[ "$ready_rc" == "130" ]]; then
+    cleanup_cancelled_launch "$prewarm_pid_file" || true
+  else
+    cleanup_failed_launch "$prewarm_pid_file" || true
+  fi
 
   MAX_MODEL_LEN=$original_len
   SERVED_NAME=$original_name
   CURRENT_SERVER_PID=$original_pid
   build_args "$host_arg"
 
+  if [[ "$ready_rc" == "130" ]]; then
+    return 130
+  fi
   if [[ "$ready_rc" == "0" ]]; then
     echo "Compile prewarm: OK"
     return 0
@@ -5460,6 +5561,12 @@ launch_server() {
   wait_for_ready "$log_file" "$url_host" || ready_rc=$?
   if [[ "$ready_rc" != "0" ]]; then
     local prewarm_len retry_rc
+    if [[ "$ready_rc" == "130" ]]; then
+      echo "Startup cancelled; cleaning up server processes."
+      cleanup_cancelled_launch "$pid_file"
+      restore_overcommit_memory || true
+      return 130
+    fi
     if cold_compile_admission_failure "$log_file"; then
       prewarm_len=$(cold_compile_prewarm_len "$log_file" || true)
       if [[ -n "$prewarm_len" ]]; then
@@ -5474,6 +5581,12 @@ launch_server() {
           STAMP=$old_stamp
           unset VLLM_COMPILE_PREWARM_RETRY
           return "$retry_rc"
+        else
+          retry_rc=$?
+          if [[ "$retry_rc" == "130" ]]; then
+            restore_overcommit_memory || true
+            return 130
+          fi
         fi
       fi
     fi
@@ -6050,13 +6163,15 @@ read_main_menu_choice() {
   fi
 
   if [[ "$key" == $'\x1b' ]]; then
-    read -rsn2 -t 0.1 seq </dev/tty || true
+    seq=$(read_escape_sequence) || seq=""
     if [[ -z "$seq" ]]; then
       return 1
     fi
     case "$seq" in
-      "[A")
-        if (( current > 1 )); then
+      "[A"|"OA")
+        if (( current == 0 )); then
+          current=9
+        elif (( current > 1 )); then
           current=$((current - 1))
         else
           current=0
@@ -6064,7 +6179,7 @@ read_main_menu_choice() {
         printf '__INDEX__:%s\n' "$current"
         return 0
         ;;
-      "[B")
+      "[B"|"OB")
         if (( current == 0 )); then
           current=1
         elif (( current < 9 )); then
