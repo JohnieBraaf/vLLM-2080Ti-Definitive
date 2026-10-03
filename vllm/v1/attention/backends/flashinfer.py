@@ -752,6 +752,10 @@ class FIPrefill:
     sm75_num_reqs: int = 0
     sm75_query_len: int = 0
     sm75_query_start_pos: int = 0  # absolute position of first query token
+    # Causality of the calling layer's attention. Decoder self-attention is
+    # causal; DFlash drafters are trained non-causal (config.is_causal=false)
+    # and must read the whole query block bidirectionally.
+    sm75_causal: bool = True
 
 
 @dataclass
@@ -1987,6 +1991,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         - common_attn_metadata.max_query_len
                         + 1
                     ),
+                    sm75_causal=(
+                        bool(common_attn_metadata.causal)
+                        if isinstance(common_attn_metadata.causal, bool)
+                        else True
+                    ),
                     )
                     if not torch.cuda.is_current_stream_capturing():
                         _wk=(common_attn_metadata.max_query_len,self.page_size,getattr(self.kv_cache_spec,"head_size",128),self.num_kv_heads,self.num_qo_heads)
@@ -2612,8 +2621,9 @@ class FlashInferImpl(AttentionImpl):
                             )
                             # SM75 bypass: FlashInfer's AOT SM75 prefill cubin
                             # faults (Xid 13) for this speculative query shape.
-                            # Self-attn layers need a causal mask over the
-                            # within-batch K/V; cross-attn layers do not.
+                            # Causality comes from the layer's attention metadata:
+                            # decoder self-attn is causal, DFlash draft self-attn
+                            # is non-causal over the whole query block.
                             _is_self = key is not None and key.shape[0] > 0
                             if _is_self:
                                 self.do_kv_cache_update(
@@ -2643,7 +2653,7 @@ class FlashInferImpl(AttentionImpl):
                                     attn_metadata.prefill.sm75_query_len,
                                     self.scale,
                                     out_prefill,
-                                    causal=True,
+                                    causal=attn_metadata.prefill.sm75_causal,
                                     query_start_pos=_qsp,
                                 )
                             else:
