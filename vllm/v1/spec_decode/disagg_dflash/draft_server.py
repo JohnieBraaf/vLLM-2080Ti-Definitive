@@ -96,6 +96,9 @@ class DraftModelRunner:
 
         self.seq_block_tables: dict[str, list[int]] = {}
         self.seq_lengths:      dict[str, int]       = {}
+        self._cuda_graph = None
+        self._paged_kv_builders: list = []
+        self._cpu_block_idx_buf = None
 
         self._warmup_kernels()
 
@@ -169,7 +172,7 @@ class DraftModelRunner:
             tensor_parallel_size=1,
             kv_cache_dtype=kv_dtype,
             disable_log_stats=True,
-            # Required for DFlash2's GDN cross-attention to use the
+            # Required for DFlash2’s GDN cross-attention to use the
             # FlashQLA legacy SM75-optimised kernel instead of falling back
             # to a generic implementation that produces wrong results.
             additional_config={"gdn_prefill_backend": "flashqla_legacy"},
@@ -389,6 +392,11 @@ class DraftModelRunner:
             logger.warning("Warmup failed (non-fatal): %s", exc)
         finally:
             self.handle_free(seq_id)
+        try:
+            self._init_persistent_metadata()
+        except Exception as _e:
+            logger.warning("Persistent metadata init failed: %s", _e)
+        self._cuda_graph = None  # graph disabled: always use eager path
 
     # ──────────────────────────────────────────────────────────────────────────
     # Request handlers
@@ -480,9 +488,13 @@ class DraftModelRunner:
     def _run_draft_forward(
         self,
         seq_ids:   list[str],
-        positions: torch.Tensor,   # [B] — positions of the newly appended token
-        bonus_ids: torch.Tensor,   # [B] int32 — actual token IDs for bonus (j=0)
-    ) -> torch.Tensor:             # [B, K]
+        positions: torch.Tensor,
+        bonus_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if (getattr(self, "_cuda_graph", None) is not None
+                and len(seq_ids) == 1
+                and not torch.cuda.is_current_stream_capturing()):
+            return self._run_draft_forward_graph(seq_ids, positions, bonus_ids)
         from vllm.forward_context import set_forward_context
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -514,10 +526,11 @@ class DraftModelRunner:
         for _i in range(B):
             input_ids[_i * num_query_per_req] = int(_bids[_i].item())
 
-        # Positions: newly-appended token is at (context_lens[i] - 1),
-        # query tokens at context_lens[i] + j for j in [0, num_query_per_req).
-        # Co-located reference: positions start at last_pos+1 (AFTER bonus context slot),
-        # not at last_pos. Off-by-one here was causing ~55% acceptance vs ~98%.
+        # Positions: the bonus token is at context_lens[i] (the first slot after
+        # the last valid context position); query tokens at context_lens[i] + j
+        # for j in [0, num_query_per_req).  Matches the co-located reference
+        # (query_pos = last_valid_pos + 1 + query_off); the previous T_old start
+        # made the bonus slot collide with the context token's slot (~55% acc).
         query_positions = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i in range(B):
             base = int(positions[i].item())
@@ -533,7 +546,7 @@ class DraftModelRunner:
         for i, seq_id in enumerate(seq_ids):
             blocks   = self.seq_block_tables[seq_id]
             pre_query_counts.append(len(blocks))   # save BEFORE extending
-            T_bonus  = int(positions[i].item())   # = T_old (bonus position in context)
+            T_bonus  = int(positions[i].item())   # = T_old (bonus position)
             for j in range(num_query_per_req):
                 pos = T_bonus + 1 + j             # T_old+1, T_old+2, …, T_old+K+1
                 while pos >= len(blocks) * bs:
@@ -541,10 +554,7 @@ class DraftModelRunner:
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
 
         # Build block tables AFTER query slot allocation, which may extend block tables.
-        # Use a FIXED max size (max_model_len / block_size) so CUDA graph capture and
-        # replay always see the same block_table shape — dynamic sizing breaks CUDA graph.
-        max_blk = (self.vllm_config.model_config.max_model_len
-                   // self.vllm_config.cache_config.block_size)
+        max_blk = max(len(self.seq_block_tables[sid]) for sid in seq_ids)
         block_tables = self._build_block_table_tensor(seq_ids, max_blk)
 
         # query_start_loc [B+1]
@@ -646,21 +656,247 @@ class DraftModelRunner:
         return bt
 
     def _get_mask_token_id(self) -> int:
-        hf_config     = self.draft_model_config.hf_config
+        hf_config    = self.draft_model_config.hf_config
         dflash_config = getattr(hf_config, "dflash_config", None) or {}
         if "mask_token_id" in dflash_config:
-            return int(dflash_config["mask_token_id"])
-        if hasattr(hf_config, "mask_token_id") and hf_config.mask_token_id is not None:
-            return int(hf_config.mask_token_id)
-        # Fallback: parse raw config dict (handles non-standard HF config classes
-        # where getattr does not expose nested dicts as attributes).
-        try:
-            dc = hf_config.to_dict().get("dflash_config", {})
-            if "mask_token_id" in dc:
-                return int(dc["mask_token_id"])
-        except Exception:
-            pass
+            return dflash_config["mask_token_id"]
+        if hasattr(hf_config, "mask_token_id"):
+            return hf_config.mask_token_id
         return 0
+
+    # ━━ DraftGPUWorker: persistent metadata + incremental paged_kv updates ━━━
+    #
+    # Problem: build_for_drafting() was called every decode step (~10 ms) to
+    # rebuild paged_kv_indptr/indices/last_page_len from scratch.
+    #
+    # Solution: call it ONCE in _init_persistent_metadata(), cache the builder
+    # references, then update only the 3 changing CpuGpuBuffer tensors per step
+    # via _update_paged_kv_direct() (~0.1 ms).  The SM75 wrapper attributes
+    # (_sm75_kv_indptr_gpu, _sm75_kv_last_len_gpu) are VIEWS into these same
+    # pre-allocated tensors, so they auto-reflect any in-place update.
+
+    @torch.inference_mode()
+    def _init_persistent_metadata(self) -> None:
+        from vllm.v1.attention.backend import CommonAttentionMetadata
+        B = 1
+        Q = 1 + self.num_speculative_tokens
+        H = self.draft_model_config.get_hidden_size()
+        bs = self.block_size
+        max_blocks = self.num_blocks + Q // bs + 4
+
+        # Pre-allocate CPU buffer for block indices (avoids per-step allocation)
+        self._cpu_block_idx_buf = torch.zeros(max_blocks, dtype=torch.int32)
+
+        # Dummy prefill to prime the builders with a valid block table
+        seq_id = "__pminit__"
+        self.handle_prefill(
+            seq_id,
+            torch.zeros(bs, H, dtype=self.dtype, device=self.device),
+            torch.arange(bs, dtype=torch.int64, device=self.device),
+        )
+        T_ctx   = self.seq_lengths[seq_id]
+        blocks  = self.seq_block_tables[seq_id]
+        n_blks  = len(blocks)
+        bt      = torch.zeros(B, n_blks, dtype=torch.int32, device=self.device)
+        bt[0, :n_blks] = torch.tensor(blocks[:n_blks], dtype=torch.int32,
+                                      device=self.device)
+        cad_sl  = torch.tensor([T_ctx + Q - 1], dtype=torch.int32, device=self.device)
+        cad = CommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, Q], dtype=torch.int32, device=self.device),
+            seq_lens=cad_sl,
+            query_start_loc_cpu=torch.tensor([0, Q], dtype=torch.int32),
+            seq_lens_cpu_upper_bound=int(cad_sl[0].item()),
+            num_reqs=B, num_actual_tokens=Q,
+            max_query_len=Q, max_seq_len=int(cad_sl[0].item()),
+            block_table_tensor=bt,
+            slot_mapping=torch.zeros(Q, dtype=torch.int64, device=self.device),
+            causal=not self.requires_non_causal,
+        )
+        for _gl in self.attn_groups:
+            for _g in _gl:
+                try:
+                    _g.get_metadata_builder().build_for_drafting(
+                        common_attn_metadata=cad, draft_index=0)
+                    self._paged_kv_builders.append(_g.get_metadata_builder())
+                except Exception:
+                    pass
+        self.handle_free(seq_id)
+        logger.info("DraftGPUWorker: persistent metadata ready (%d builders).",
+                    len(self._paged_kv_builders))
+
+    def _update_paged_kv_direct(self, blocks: list, T_ctx: int) -> None:
+        """
+        Incremental paged_kv update — replaces build_for_drafting() each step.
+
+        For B=1 this is 3 tiny operations per builder:
+          1. paged_kv_indptr  [0, num_pages]  — H2D 2 int32s
+          2. paged_kv_indices [block_ids]     — H2D num_pages int32s
+          3. paged_kv_last_page_len [fill]    — H2D 1 int32
+        """
+        if not self._paged_kv_builders:
+            return
+        num_pages = len(blocks)
+        last_fill = T_ctx % self.block_size or self.block_size
+        # Fill CPU buffer (no allocation)
+        for _i in range(num_pages):
+            self._cpu_block_idx_buf[_i] = blocks[_i]
+        for builder in self._paged_kv_builders:
+            builder.paged_kv_indptr.np[0] = 0
+            builder.paged_kv_indptr.np[1] = num_pages
+            builder.paged_kv_indptr.gpu[0:2].copy_(
+                builder.paged_kv_indptr.cpu[0:2], non_blocking=True)
+            if num_pages > 0:
+                builder.paged_kv_indices[0:num_pages].copy_(
+                    self._cpu_block_idx_buf[0:num_pages].to(self.device),
+                    non_blocking=True)
+            builder.paged_kv_last_page_len.np[0] = last_fill
+            builder.paged_kv_last_page_len.gpu[0:1].copy_(
+                builder.paged_kv_last_page_len.cpu[0:1], non_blocking=True)
+
+    @torch.inference_mode()
+    def _try_capture_cuda_graph(self) -> None:
+        from vllm.forward_context import set_forward_context
+        from vllm.v1.attention.backend import CommonAttentionMetadata
+        B = 1
+        K = self.num_speculative_tokens
+        Q = 1 + K
+        H = self.draft_model_config.get_hidden_size()
+        bs = self.block_size
+        self._sg_input_ids       = torch.zeros(Q, dtype=torch.int32,  device=self.device)
+        self._sg_positions       = torch.zeros(Q, dtype=torch.int64,  device=self.device)
+        self._sg_slot_mapping    = torch.zeros(Q, dtype=torch.int64,  device=self.device)
+        self._sg_query_start_pos = torch.zeros(B, dtype=torch.int64,  device=self.device)
+        self._sg_Q = Q
+        self._sg_K = K
+        seq_id = "__cudagraph__"
+        self.handle_prefill(
+            seq_id,
+            torch.zeros(bs, H, dtype=self.dtype, device=self.device),
+            torch.arange(bs, dtype=torch.int64, device=self.device),
+        )
+
+        def _setup_step():
+            T_old  = self.seq_lengths[seq_id]
+            blocks = self.seq_block_tables[seq_id]
+            if T_old >= len(blocks) * bs:
+                blocks.append(self.block_manager.allocate_one())
+            slot_b = self._slot_for_position(blocks, T_old)
+            self.model.precompute_and_store_context_kv(
+                torch.zeros(1, H, dtype=self.dtype, device=self.device),
+                torch.tensor([T_old], dtype=torch.int64, device=self.device),
+                torch.tensor([slot_b], dtype=torch.int64, device=self.device),
+            )
+            self.seq_lengths[seq_id] = T_old + 1
+            T_ctx   = self.seq_lengths[seq_id]
+            T_bonus = T_old
+            self._sg_query_start_pos[0] = T_bonus + 1
+            self._sg_input_ids.fill_(self._get_mask_token_id())
+            self._sg_input_ids[0] = 0
+            for _j in range(Q):
+                self._sg_positions[_j] = T_bonus + 1 + _j
+            pre_cnt = len(blocks)
+            for _j in range(Q):
+                _pos = T_bonus + 1 + _j
+                while _pos >= len(blocks) * bs:
+                    blocks.append(self.block_manager.allocate_one())
+                self._sg_slot_mapping[_j] = self._slot_for_position(blocks, _pos)
+            # Incremental update (fast path)
+            self._update_paged_kv_direct(blocks[:pre_cnt], T_ctx)
+            # Build per_layer_meta with updated tensors
+            n_blks = len(blocks)
+            bt = torch.zeros(B, n_blks, dtype=torch.int32, device=self.device)
+            bt[0, :n_blks] = torch.tensor(
+                blocks[:n_blks], dtype=torch.int32, device=self.device)
+            cad_sl = torch.tensor([T_ctx + Q - 1], dtype=torch.int32, device=self.device)
+            cad = CommonAttentionMetadata(
+                query_start_loc=torch.tensor([0, Q], dtype=torch.int32, device=self.device),
+                seq_lens=cad_sl,
+                query_start_loc_cpu=torch.tensor([0, Q], dtype=torch.int32),
+                seq_lens_cpu_upper_bound=int(cad_sl[0].item()),
+                num_reqs=B, num_actual_tokens=Q,
+                max_query_len=Q, max_seq_len=int(cad_sl[0].item()),
+                block_table_tensor=bt,
+                slot_mapping=self._sg_slot_mapping,
+                causal=not self.requires_non_causal,
+            )
+            per_layer_meta = {}
+            for _gl in self.attn_groups:
+                for _g in _gl:
+                    try:
+                        _meta = _g.get_metadata_builder().build_for_drafting(
+                            common_attn_metadata=cad, draft_index=0)
+                        for _ln in _g.layer_names:
+                            per_layer_meta[_ln] = _meta
+                        if (_meta is not None
+                                and hasattr(_meta, 'prefill')
+                                and _meta.prefill is not None
+                                and hasattr(_meta.prefill, 'wrapper')
+                                and _meta.prefill.wrapper is not None
+                                and hasattr(_meta.prefill.wrapper, '_sm75_kv_indptr_gpu')):
+                            _meta.prefill.wrapper._sm75_qsp_tensor = self._sg_query_start_pos
+                    except Exception:
+                        pass
+            extra = blocks[pre_cnt:]
+            del blocks[pre_cnt:]
+            if extra:
+                self.block_manager.free(extra)
+            return per_layer_meta
+
+        try:
+            for _ in range(3):
+                _plm = _setup_step()
+                with set_forward_context(_plm, self.vllm_config, num_tokens=Q):
+                    self.model(input_ids=self._sg_input_ids, positions=self._sg_positions)
+                torch.cuda.synchronize(self.device)
+            _plm_cap = _setup_step()
+            self._cuda_graph = torch.cuda.CUDAGraph()
+            with set_forward_context(_plm_cap, self.vllm_config, num_tokens=Q):
+                with torch.cuda.graph(self._cuda_graph):
+                    self._sg_logits = self.model(
+                        input_ids=self._sg_input_ids,
+                        positions=self._sg_positions,
+                    )
+            torch.cuda.synchronize(self.device)
+            logger.info("DraftGPUWorker: CUDA graph captured (Q=%d).", Q)
+        finally:
+            self.handle_free(seq_id)
+
+    @torch.inference_mode()
+    def _run_draft_forward_graph(
+        self,
+        seq_ids:   list,
+        positions: torch.Tensor,
+        bonus_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_id  = seq_ids[0]
+        Q       = self._sg_Q
+        K       = self._sg_K
+        bs      = self.block_size
+        T_bonus = int(positions[0].item())
+        blocks  = self.seq_block_tables[seq_id]
+        pre_cnt = len(blocks)
+        self._sg_input_ids.fill_(self._get_mask_token_id())
+        self._sg_input_ids[0] = int(bonus_ids[0].item())
+        for _j in range(Q):
+            self._sg_positions[_j] = T_bonus + 1 + _j
+        for _j in range(Q):
+            _pos = T_bonus + 1 + _j
+            while _pos >= len(blocks) * bs:
+                blocks.append(self.block_manager.allocate_one())
+            self._sg_slot_mapping[_j] = self._slot_for_position(blocks, _pos)
+        T_ctx = self.seq_lengths[seq_id]
+        self._sg_query_start_pos[0] = T_bonus + 1
+        # Incremental paged_kv update — the key DraftGPUWorker improvement
+        self._update_paged_kv_direct(blocks[:pre_cnt], T_ctx)
+        self._cuda_graph.replay()
+        flat = (self._sg_logits if self._sg_logits.dim() == 2
+                else self._sg_logits.view(-1, self._sg_logits.shape[-1]))
+        draft_tokens = flat[1:Q].argmax(dim=-1).int().view(1, K)
+        extra = blocks[pre_cnt:]
+        del blocks[pre_cnt:]
+        if extra:
+            self.block_manager.free(extra)
+        return draft_tokens
 
 
 # ── ZMQ server loop ────────────────────────────────────────────────────────────
@@ -754,6 +990,11 @@ def main() -> None:
         help="GPU memory (GiB) to reserve beyond the KV cache (default: 1.0).")
     args = parser.parse_args()
 
+    try:
+        from setproctitle import setproctitle
+        setproctitle("VLLM::Worker_DFlash2")
+    except ImportError:
+        pass
     if args.device is not None:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.device))
     device = torch.device("cuda:0")

@@ -94,6 +94,42 @@ class DisaggDFlashProposer(BaseSpeculator):
         except Exception:
             self._tp_rank = 0
 
+        # Spawn draft worker subprocess when VLLM_DRAFT_WORKER_GPU is set.
+        # subprocess.Popen avoids the Python restriction that daemon processes
+        # (which vLLM worker processes are) cannot spawn multiprocessing children.
+        _draft_gpu = os.environ.get('VLLM_DRAFT_WORKER_GPU')
+        if self._tp_rank == 0 and _draft_gpu is not None:
+            import subprocess as _sp, sys as _sys, tempfile as _tf
+            _cfg = os.path.join(_tf.gettempdir(),
+                                f'vllm-draft-config-{os.getpid()}.json')
+            DisaggDFlashProposer.write_draft_config(vllm_config, _cfg)
+            _port = self.address.rsplit(':', 1)[-1] if ':' in self.address else '50052'
+            _bind = f'tcp://0.0.0.0:{_port}'
+            _env = dict(os.environ)
+            _env['CUDA_VISIBLE_DEVICES'] = _draft_gpu
+            for _src, _dst in [
+                    ('VLLM_DRAFT_TRITON_CACHE',    'TRITON_CACHE_DIR'),
+                    ('VLLM_DRAFT_FLASHINFER_WS',   'FLASHINFER_WORKSPACE_BASE'),
+            ]:
+                if _src in os.environ:
+                    _env[_dst] = os.environ[_src]
+            self._draft_process = _sp.Popen(
+                [_sys.executable, '-m',
+                 'vllm.v1.spec_decode.disagg_dflash.draft_server',
+                 '--device', _draft_gpu,
+                 '--address', _bind,
+                 '--config-json', _cfg,
+                 '--dist-master-port',
+                 os.environ.get('VLLM_DRAFT_DIST_PORT', '29600'),
+                 '--kv-headroom-gb',
+                 os.environ.get('VLLM_DRAFT_KV_HEADROOM_GB', '1.0')],
+                env=_env,
+            )
+            logger.info('Draft worker spawned: pid=%d gpu=%s bind=%s',
+                        self._draft_process.pid, _draft_gpu, _bind)
+        else:
+            self._draft_process = None
+
         if self._tp_rank == 0:
             self._zmq_ctx = zmq.Context()
             self._sock    = self._zmq_ctx.socket(zmq.DEALER)
@@ -350,6 +386,11 @@ class DisaggDFlashProposer(BaseSpeculator):
                 self._sock.close(linger=0)
             if self._zmq_ctx is not None:
                 self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_draft_process', None) is not None:
+                self._draft_process.terminate()
         except Exception:
             pass
 
