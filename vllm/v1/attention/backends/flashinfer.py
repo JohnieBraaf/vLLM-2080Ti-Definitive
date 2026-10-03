@@ -188,7 +188,7 @@ def _sm75_spec_prefill_graph_query_len(
         or vllm_config.attention_config.use_non_causal
         or envs.VLLM_BATCH_INVARIANT
         or speculative_config is None
-        or not 1 <= speculative_config.num_speculative_tokens <= 15
+        or not 1 <= speculative_config.num_speculative_tokens <= 7
         or compilation_config.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
     ):
         return None
@@ -751,6 +751,7 @@ class FIPrefill:
     sm75_page_size: int = 0
     sm75_num_reqs: int = 0
     sm75_query_len: int = 0
+    sm75_query_start_pos: int = 0  # absolute position of first query token
 
 
 @dataclass
@@ -881,6 +882,11 @@ class FlashInferMetadata:
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+    supports_draft_decode_metadata_update = True
+
+    def update_draft_decode_metadata(self, _metadata) -> None:
+        pass
+
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
 
@@ -1963,7 +1969,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 if (
                     paged_kv_indices is not None
                     and num_prefills > 0
-                    and 1 < common_attn_metadata.max_query_len <= 16
+                    and 1 < common_attn_metadata.max_query_len <= 8
                     and num_prefill_tokens
                     == common_attn_metadata.max_query_len * num_prefills
                     and current_platform.is_device_capability(75)
@@ -1976,29 +1982,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         sm75_page_size=self.page_size,
                         sm75_num_reqs=num_prefills,
                         sm75_query_len=common_attn_metadata.max_query_len,
+                    sm75_query_start_pos=(
+                        common_attn_metadata.seq_lens_cpu_upper_bound
+                        - common_attn_metadata.max_query_len
+                        + 1
+                    ),
                     )
-                    # Pre-compile the Triton kernel while outside CUDA graph capture
-                    # so that the first call inside forward() (inside capture) uses
-                    # the already-compiled kernel and gets properly recorded.
                     if not torch.cuda.is_current_stream_capturing():
-                        _wk = (
-                            common_attn_metadata.max_query_len,
-                            self.page_size,
-                            getattr(self.kv_cache_spec, 'head_size', 128),
-                            self.num_kv_heads,
-                            self.num_qo_heads,
-                        )
-                        if not hasattr(self, '_sm75_warmed_up'):
-                            self._sm75_warmed_up = set()
-                        if _wk not in self._sm75_warmed_up:
-                            self._sm75_warmed_up.add(_wk)
+                        _wk=(common_attn_metadata.max_query_len,self.page_size,getattr(self.kv_cache_spec,"head_size",128),self.num_kv_heads,self.num_qo_heads)
+                        if not hasattr(self,"_sm75wu"):self._sm75wu=set()
+                        if _wk not in self._sm75wu:
+                            self._sm75wu.add(_wk)
                             try:
-                                from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
-                                    _do_sm75_triton_warmup,
-                                )
-                                _do_sm75_triton_warmup(*_wk)
-                            except Exception:
-                                pass
+                                from vllm.v1.attention.backends.sm75_blhnc_paged_attn import _do_sm75_triton_warmup;_do_sm75_triton_warmup(*_wk)
+                            except Exception:pass
                 else:
                     attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -2608,24 +2605,59 @@ class FlashInferImpl(AttentionImpl):
                             isinstance(attn_metadata.prefill, FIPrefill)
                             and attn_metadata.prefill.sm75_page_size > 0
                             and hasattr(prefill_wrapper, '_sm75_kv_indptr_gpu')
-                            and kv_cache.ndim == 4
-                            and kv_cache.shape[2] <= 16
-                            and (key is None or key.shape[0] == 0)
                         ):
                             from vllm.v1.attention.backends.sm75_blhnc_paged_attn import (
+                                sm75_paged_attn,
                                 sm75_paged_cross_attn,
                             )
-                            sm75_paged_cross_attn(
-                                prefill_query,
-                                kv_cache,
-                                prefill_wrapper._sm75_kv_indptr_gpu,
-                                prefill_wrapper._sm75_kv_indices_gpu,
-                                prefill_wrapper._sm75_kv_last_len_gpu,
-                                attn_metadata.prefill.sm75_num_reqs,
-                                attn_metadata.prefill.sm75_query_len,
-                                self.scale,
-                                out_prefill,
-                            )
+                            # SM75 bypass: FlashInfer's AOT SM75 prefill cubin
+                            # faults (Xid 13) for this speculative query shape.
+                            # Self-attn layers need a causal mask over the
+                            # within-batch K/V; cross-attn layers do not.
+                            _is_self = key is not None and key.shape[0] > 0
+                            if _is_self:
+                                self.do_kv_cache_update(
+                                    layer, key, value, kv_cache,
+                                    attn_metadata.slot_mapping[:num_actual_tokens],
+                                )
+                                # Stable GPU tensor for the causal limit so that
+                                # CUDA-graph replay reads the current T_bonus
+                                # from a fixed address (written by the caller).
+                                _qsp = getattr(
+                                    prefill_wrapper, '_sm75_qsp_tensor', None
+                                )
+                                if _qsp is None:
+                                    _qsp = torch.tensor(
+                                        [attn_metadata.prefill.sm75_query_start_pos],
+                                        dtype=torch.int64,
+                                        device=out_prefill.device,
+                                    )
+                                    prefill_wrapper._sm75_qsp_tensor = _qsp
+                                sm75_paged_attn(
+                                    prefill_query,
+                                    kv_cache,
+                                    prefill_wrapper._sm75_kv_indptr_gpu,
+                                    prefill_wrapper._sm75_kv_indices_gpu,
+                                    prefill_wrapper._sm75_kv_last_len_gpu,
+                                    attn_metadata.prefill.sm75_num_reqs,
+                                    attn_metadata.prefill.sm75_query_len,
+                                    self.scale,
+                                    out_prefill,
+                                    causal=True,
+                                    query_start_pos=_qsp,
+                                )
+                            else:
+                                sm75_paged_cross_attn(
+                                    prefill_query,
+                                    kv_cache,
+                                    prefill_wrapper._sm75_kv_indptr_gpu,
+                                    prefill_wrapper._sm75_kv_indices_gpu,
+                                    prefill_wrapper._sm75_kv_last_len_gpu,
+                                    attn_metadata.prefill.sm75_num_reqs,
+                                    attn_metadata.prefill.sm75_query_len,
+                                    self.scale,
+                                    out_prefill,
+                                )
                         else:
                             prefill_wrapper.run(
                                 prefill_query,
