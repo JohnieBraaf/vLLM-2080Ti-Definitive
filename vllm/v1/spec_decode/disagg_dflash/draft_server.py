@@ -933,35 +933,37 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
         header_frame = parts[2] if len(parts) >= 4 else parts[1]
         payload_frame = parts[3] if len(parts) >= 4 else parts[2]
 
+        _seq = 0
         try:
             header = parse_header(header_frame)
             t      = header["t"]
+            _seq   = int(header.get("seq", 0))
 
             if t == MSG_PING:
-                resp_h, resp_p = build_ack()
+                resp_h, resp_p = build_ack(_seq)
 
             elif t == MSG_PREFILL:
                 hs, pos = parse_prefill_payload(header, payload_frame)
                 runner.handle_prefill(header["seq_id"], hs, pos)
-                resp_h, resp_p = build_ack()
+                resp_h, resp_p = build_ack(_seq)
 
             elif t == MSG_DECODE:
                 hs, pos, temps, sds, bonus_ids = parse_decode_payload(header, payload_frame)
                 draft_tokens = runner.handle_decode(
                     header["seq_ids"], hs, pos, temps, sds, bonus_ids
                 )
-                resp_h, resp_p = build_draft_response(draft_tokens)
+                resp_h, resp_p = build_draft_response(draft_tokens, _seq)
 
             elif t == MSG_FREE:
                 runner.handle_free(header["seq_id"])
-                resp_h, resp_p = build_ack()
+                resp_h, resp_p = build_ack(_seq)
 
             else:
-                resp_h, resp_p = build_error(f"unknown message type {t}")
+                resp_h, resp_p = build_error(f"unknown message type {t}", _seq)
 
         except Exception as exc:
             logger.exception("Error handling message type %s", header.get("t"))
-            resp_h, resp_p = build_error(str(exc))
+            resp_h, resp_p = build_error(str(exc), _seq)
 
         sock.send_multipart([identity, b"", resp_h, resp_p])
 

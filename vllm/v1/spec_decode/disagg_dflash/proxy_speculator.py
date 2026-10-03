@@ -136,6 +136,7 @@ class DisaggDFlashProposer(BaseSpeculator):
             self._sock.setsockopt(zmq.RCVTIMEO, _TIMEOUT_MS)
             self._sock.setsockopt(zmq.SNDTIMEO, _TIMEOUT_MS)
             self._sock.connect(self.address)
+            self._seq = 0
             logger.info(
                 "DisaggDFlashProposer connected to draft server at %s", self.address
             )
@@ -324,19 +325,37 @@ class DisaggDFlashProposer(BaseSpeculator):
     # ZMQ helpers (rank 0 only)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _send(self, header: bytes, payload: bytes) -> tuple[bytes, bytes]:
+    def _request(self, builder, *args) -> tuple[dict, bytes]:
+        """Send one request and return the matching response.
+
+        Every request carries a monotonically increasing sequence number that
+        the server echoes back.  Replies whose sequence does not match the
+        outstanding request are stale leftovers from an earlier timed-out
+        request; they are dropped so the DEALER frame stream stays in sync.
+        """
+        self._seq += 1
+        seq = self._seq
+        header, payload = builder(*args, seq=seq)
         self._sock.send_multipart([b"", header, payload])
-        parts = self._sock.recv_multipart()
-        if len(parts) == 3:
-            return parts[1], parts[2]
-        if len(parts) == 2:
-            return parts[0], parts[1]
-        raise RuntimeError(f"Unexpected ZMQ response frames: {len(parts)}")
+        while True:
+            try:
+                parts = self._sock.recv_multipart()
+            except zmq.Again:
+                raise TimeoutError("draft server did not respond in time")
+            if len(parts) == 3:
+                resp_h, resp_p = parts[1], parts[2]
+            elif len(parts) == 2:
+                resp_h, resp_p = parts[0], parts[1]
+            else:
+                raise RuntimeError(f"Unexpected ZMQ response frames: {len(parts)}")
+            hdr = parse_header(resp_h)
+            if hdr.get("seq", -1) == seq:
+                return hdr, resp_p
+            logger.debug("Dropping stale draft response seq=%s (want %s)",
+                         hdr.get("seq"), seq)
 
     def _ping_server(self) -> None:
-        h, _ = build_ping()
-        resp_h, _ = self._send(h, b"")
-        hdr = parse_header(resp_h)
+        hdr, _ = self._request(build_ping)
         if hdr.get("t") != MSG_ACK:
             raise RuntimeError(f"Draft server ping failed: {hdr}")
         logger.info("Draft server ping OK.")
@@ -347,9 +366,7 @@ class DisaggDFlashProposer(BaseSpeculator):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        h, p = build_prefill(seq_id, hidden_states, positions)
-        resp_h, _ = self._send(h, p)
-        hdr = parse_header(resp_h)
+        hdr, _ = self._request(build_prefill, seq_id, hidden_states, positions)
         if hdr.get("t") != MSG_ACK:
             raise RuntimeError(f"PREFILL failed for {seq_id}: {hdr}")
 
@@ -362,19 +379,17 @@ class DisaggDFlashProposer(BaseSpeculator):
         seeds: torch.Tensor,
         bonus_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        h, p = build_decode(seq_ids, hidden_states, positions, temperatures, seeds,
-                            bonus_token_ids)
-        resp_h, resp_p = self._send(h, p)
-        hdr = parse_header(resp_h)
+        hdr, resp_p = self._request(
+            build_decode, seq_ids, hidden_states, positions, temperatures, seeds,
+            bonus_token_ids,
+        )
         if hdr.get("t") != MSG_ACK:
             raise RuntimeError(f"DECODE failed: {hdr}")
         return parse_draft_response(hdr, resp_p)
 
     def _send_free(self, seq_id: str) -> None:
-        h, p = build_free(seq_id)
         try:
-            resp_h, _ = self._send(h, p)
-            hdr = parse_header(resp_h)
+            hdr, _ = self._request(build_free, seq_id)
             if hdr.get("t") != MSG_ACK:
                 logger.warning("FREE ack unexpected for %s: %s", seq_id, hdr)
         except Exception:

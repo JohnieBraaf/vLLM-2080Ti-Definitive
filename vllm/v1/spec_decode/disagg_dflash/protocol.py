@@ -46,14 +46,15 @@ def unpack_tensor(buf: bytes, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
 
 # ── request builders ───────────────────────────────────────────────────────────
 
-def build_ping() -> tuple[bytes, bytes]:
-    return msgpack.packb({"t": MSG_PING}), b""
+def build_ping(seq: int = 0) -> tuple[bytes, bytes]:
+    return msgpack.packb({"t": MSG_PING, "seq": seq}), b""
 
 
 def build_prefill(
     seq_id: str,
     hidden_states: torch.Tensor,   # [T, H] float16
     positions: torch.Tensor,        # [T] int64
+    seq: int = 0,
 ) -> tuple[bytes, bytes]:
     T, H = hidden_states.shape
     header = {
@@ -61,6 +62,7 @@ def build_prefill(
         "seq_id": seq_id,
         "T":      T,
         "H":      H,
+        "seq":    seq,
     }
     # payload: hidden_states bytes || positions bytes
     payload = pack_tensor(hidden_states.cpu().to(torch.float16)) + \
@@ -75,6 +77,7 @@ def build_decode(
     temperatures: torch.Tensor,     # [B] float32
     seeds: torch.Tensor,            # [B] int64
     bonus_token_ids: torch.Tensor,  # [B] int32 — actual token IDs for bonus (j=0)
+    seq: int = 0,
 ) -> tuple[bytes, bytes]:
     B, H = hidden_states.shape
     header = {
@@ -82,6 +85,7 @@ def build_decode(
         "seq_ids": seq_ids,
         "B":       B,
         "H":       H,
+        "seq":     seq,
     }
     payload = (
         pack_tensor(hidden_states.cpu().to(torch.float16)) +
@@ -93,25 +97,25 @@ def build_decode(
     return msgpack.packb(header), payload
 
 
-def build_free(seq_id: str) -> tuple[bytes, bytes]:
-    return msgpack.packb({"t": MSG_FREE, "seq_id": seq_id}), b""
+def build_free(seq_id: str, seq: int = 0) -> tuple[bytes, bytes]:
+    return msgpack.packb({"t": MSG_FREE, "seq_id": seq_id, "seq": seq}), b""
 
 
 # ── response builders ──────────────────────────────────────────────────────────
 
-def build_ack() -> tuple[bytes, bytes]:
-    return msgpack.packb({"t": MSG_ACK}), b""
+def build_ack(seq: int = 0) -> tuple[bytes, bytes]:
+    return msgpack.packb({"t": MSG_ACK, "seq": seq}), b""
 
 
-def build_draft_response(draft_tokens: torch.Tensor) -> tuple[bytes, bytes]:
+def build_draft_response(draft_tokens: torch.Tensor, seq: int = 0) -> tuple[bytes, bytes]:
     # draft_tokens: [B, K] int32
     B, K = draft_tokens.shape
-    header = {"t": MSG_ACK, "B": B, "K": K}
+    header = {"t": MSG_ACK, "B": B, "K": K, "seq": seq}
     return msgpack.packb(header), pack_tensor(draft_tokens.cpu().to(torch.int32))
 
 
-def build_error(msg: str) -> tuple[bytes, bytes]:
-    return msgpack.packb({"t": MSG_ERROR, "msg": msg}), b""
+def build_error(msg: str, seq: int = 0) -> tuple[bytes, bytes]:
+    return msgpack.packb({"t": MSG_ERROR, "msg": msg, "seq": seq}), b""
 
 
 # ── response parsers ───────────────────────────────────────────────────────────
