@@ -97,7 +97,9 @@ class DraftModelRunner:
 
         self.seq_block_tables: dict[str, list[int]] = {}
         self.seq_lengths:      dict[str, int]       = {}
-        self._cuda_graph = None
+        self._cuda_graph: torch.cuda.CUDAGraph | None = None
+        self._sample_idx: torch.Tensor | None = None
+        self._graph_verify = bool(os.environ.get("VLLM_DRAFT_GRAPH_VERIFY"))
 
         self._warmup_kernels()
 
@@ -453,6 +455,7 @@ class DraftModelRunner:
             self.handle_decode([seq_id], dummy_new, dummy_qsl, dummy_rej,
                                dummy_temps, dummy_seeds, dummy_bonus)
             torch.cuda.synchronize(self.device)
+            self._capture_draft_graph()
             logger.info("FlashInfer warmup complete.")
         except Exception as exc:
             logger.warning("Warmup failed (non-fatal): %s", exc)
@@ -527,7 +530,11 @@ class DraftModelRunner:
         use_aux:       bool = False,
     ) -> torch.Tensor:                # [B, K]
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
-        if use_aux:
+        # Concatenated aux rows, pre-projection: the captured step applies the
+        # drafter's fc itself when it can, so the projection only has to be
+        # computed eagerly for the steps the graph does not cover.
+        raw_states = hidden_states
+        if use_aux and self._a_raw is None:
             hidden_states = self._combine_aux(hidden_states)
         qsl      = [int(v) for v in query_start_loc.tolist()]
         rejected = [int(v) for v in num_rejected.tolist()]
@@ -546,6 +553,7 @@ class DraftModelRunner:
         # A request's run holds [accepted prefix][rejected drafts]; only the
         # prefix became real tokens for the target, so only it may enter the
         # drafter's KV cache (the reference leaves rejected rows on PAD_SLOT_ID).
+        graph_pre_L = None
         for i, seq_id in enumerate(seq_ids):
             t0, t1  = qsl[i], qsl[i + 1]
             n_valid = t1 - t0 - rejected[i]
@@ -555,9 +563,37 @@ class DraftModelRunner:
                 n_valid = 0
             if n_valid == 0:
                 continue
-            self._append_context(seq_id, hidden_states[t0:t0 + n_valid])
+            pre_L  = self.seq_lengths.get(seq_id, 0)
+            staged = False
+            if (self._cuda_graph is not None and len(seq_ids) == 1
+                    and t1 - t0 == self._graph_shape()[1]):
+                # The whole target batch is appended and the sequence length is
+                # rewound to the committed prefix: the rows past it stay in the
+                # cache as the next append's scratch, exactly as the co-located
+                # speculator leaves them.
+                if self._a_raw is not None:
+                    staged = raw_states.shape[-1] == self._a_raw.shape[-1]
+                    if staged:
+                        self._a_raw[: t1 - t0].copy_(raw_states[t0:t1])
+                        if self._graph_verify:
+                            self._append_context(
+                                seq_id, self._combine_aux(raw_states[t0:t1])[:n_valid]
+                                if use_aux else raw_states[t0:t0 + n_valid])
+                else:
+                    staged = True
+                    self._a_hidden[: t1 - t0].copy_(hidden_states[t0:t1])
+                    if self._graph_verify:
+                        self._append_context(seq_id, hidden_states[t0:t0 + n_valid])
+            if staged:
+                self.seq_lengths[seq_id] = pre_L + n_valid
+                graph_pre_L = pre_L
+                continue
+            rows = (self._combine_aux(raw_states[t0:t1])
+                    if use_aux and self._a_raw is not None
+                    else hidden_states[t0:t1])
+            self._append_context(seq_id, rows[:n_valid])
 
-        return self._run_draft_forward(seq_ids, bonus_ids)
+        return self._run_draft_forward(seq_ids, bonus_ids, graph_pre_L)
 
     def handle_free(self, seq_id: str) -> None:
         blocks = self.seq_block_tables.pop(seq_id, [])
@@ -570,6 +606,29 @@ class DraftModelRunner:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _run_draft_forward(
+        self,
+        seq_ids:   list[str],
+        bonus_ids: torch.Tensor,
+        pre_L:     int | None = None,
+    ) -> torch.Tensor:
+        """Run the draft step, replaying the captured graph when it applies.
+
+        The graph is captured for the single-request shape only, so a batching
+        scheduler would fall back to the eager path here — as does any step
+        whose batch is not exactly one full Q-row append.
+        """
+        if self._cuda_graph is not None and len(seq_ids) == 1 and pre_L is not None:
+            if not self._graph_verify:
+                return self._run_draft_forward_graph(seq_ids[0], bonus_ids, pre_L)
+            ref = self._run_draft_forward_eager(seq_ids, bonus_ids).clone()
+            got = self._run_draft_forward_graph(seq_ids[0], bonus_ids, pre_L).clone()
+            if not torch.equal(ref, got):
+                logger.warning("GRAPH VERIFY mismatch: eager=%s graph=%s",
+                               ref.tolist(), got.tolist())
+            return got
+        return self._run_draft_forward_eager(seq_ids, bonus_ids)
+
+    def _run_draft_forward_eager(
         self,
         seq_ids:   list[str],
         bonus_ids: torch.Tensor,
@@ -723,6 +782,7 @@ class DraftModelRunner:
         bonus_ids:  torch.Tensor,   # [B] bonus (anchor) token ids
         B: int,
         K: int,
+        out: torch.Tensor | None = None,   # [B, K] int32, pre-allocated for graphs
     ) -> torch.Tensor:              # [B, K] int32
         """Pick draft tokens with DFlash2's candidate selector.
 
@@ -733,10 +793,12 @@ class DraftModelRunner:
         states) yields a different token and kills acceptance.
         """
         num_query_per_req = 1 + K
-        sample_idx = torch.tensor(
-            [i * num_query_per_req + 1 + k for i in range(B) for k in range(K)],
-            dtype=torch.int64, device=self.device,
-        )
+        if self._sample_idx is None or self._sample_idx.shape[0] != B * K:
+            self._sample_idx = torch.tensor(
+                [i * num_query_per_req + 1 + k for i in range(B) for k in range(K)],
+                dtype=torch.int64, device=self.device,
+            )
+        sample_idx = self._sample_idx
         hidden = hidden_all.view(-1, hidden_all.shape[-1])[sample_idx]
         hidden = hidden.view(B, K, -1)
 
@@ -754,10 +816,11 @@ class DraftModelRunner:
 
         # Greedy walk: step l ranks successors given the candidate picked at
         # step l-1 (the anchor token at l=0).
-        draft_tokens = torch.zeros(B, K, dtype=torch.int32, device=self.device)
+        if out is None:
+            out = torch.zeros(B, K, dtype=torch.int32, device=self.device)
         rows = torch.arange(B, device=self.device)
         prev = torch.zeros(B, dtype=torch.int64, device=self.device)
-        if self._dbg and self._dbg_real:
+        if self._live_debug():
             logger.warning(
                 "DRAFT hidden mean=%.3f std=%.3f absmax=%.3f top1_ne=%d "
                 "cand0=%s unary0=%s anchor=%s",
@@ -770,11 +833,11 @@ class DraftModelRunner:
             )
         for _l in range(K):
             idx = scores[:, _l, prev, :].argmax(dim=-1)
-            draft_tokens[:, _l] = candidate_ids[rows, _l, idx].to(torch.int32)
+            out[:, _l] = candidate_ids[rows, _l, idx].to(torch.int32)
             prev = idx
-        if self._dbg and self._dbg_real:
-            logger.warning("DRAFT out=%s", draft_tokens.tolist())
-        return draft_tokens
+        if self._live_debug():
+            logger.warning("DRAFT out=%s", out.tolist())
+        return out
 
     def _candidates(
         self, hidden_states: torch.Tensor
@@ -794,7 +857,7 @@ class DraftModelRunner:
         k = self.model.model.candidate_selector.top_k
         values, ids = torch.topk(logits.float(), k, dim=-1)
         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
-        if self._dbg and self._dbg_steps == 1:
+        if self._dbg and self._dbg_steps == 1 and self._live_debug():
             fi_ids, fi_values = self.model.compute_candidates(hidden_states)
             logger.warning(
                 "CAND tp=%d vstart=%d pad=%d logits=%s/%s mean=%.4f std=%.4f "
@@ -859,16 +922,259 @@ class DraftModelRunner:
             return hf_config.mask_token_id
         return 0
 
-    # ━━ DraftGPUWorker: persistent metadata + incremental paged_kv updates ━━━
+    def _free_query_blocks(self, seq_id: str, pre_blocks: int) -> None:
+        """Release the temporary query blocks allocated for one draft step."""
+        blocks = self.seq_block_tables.get(seq_id)
+        if not blocks:
+            return
+        extra = blocks[pre_blocks:]
+        if extra:
+            del blocks[pre_blocks:]
+            self.block_manager.free(extra)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CUDA graph path (batch size 1)
+    # ──────────────────────────────────────────────────────────────────────────
     #
-    # Problem: build_for_drafting() was called every decode step (~10 ms) to
-    # rebuild paged_kv_indptr/indices/last_page_len from scratch.
+    # An eager draft step costs ~12 ms on Turing although only ~4 ms of it is GPU
+    # work: the rest is ~5000 Python calls launching ~2000 kernels (5 draft layers
+    # plus the full-vocabulary candidate head).  The draft step is strictly serial
+    # with the target's — the target cannot verify drafts it has not been handed —
+    # so that launch overhead lands straight on the critical path and is the whole
+    # reason the disaggregated profile trails the co-located one.
     #
-    # Solution: call it ONCE in _init_persistent_metadata(), cache the builder
-    # references, then update only the 3 changing CpuGpuBuffer tensors per step
-    # via _update_paged_kv_direct() (~0.1 ms).  The SM75 wrapper attributes
-    # (_sm75_kv_indptr_gpu, _sm75_kv_last_len_gpu) are VIEWS into these same
-    # pre-allocated tensors, so they auto-reflect any in-place update.
+    # Capturing one decode step (model forward + candidate selection) into a CUDA
+    # graph removes it.  Everything the recorded kernels read must live at a
+    # stable address: per-step inputs are copied into dedicated buffers, and the
+    # attention metadata is refreshed in place — FlashInfer's paged_kv_* tensors
+    # are persistent buffers, and the SM75 kernel already takes its causal
+    # position from a device tensor, so a replay sees current data.
+
+    def _live_debug(self) -> bool:
+        """Debug logging reads values back to the host, which a capture region
+        cannot do, so it stays off while a graph is being captured."""
+        return bool(self._dbg and self._dbg_real
+                    and not torch.cuda.is_current_stream_capturing())
+
+    def _graph_shape(self) -> tuple[int, int]:
+        return 1, 1 + self.num_speculative_tokens
+
+    def _init_graph_buffers(self) -> None:
+        B, Q = self._graph_shape()
+        K    = self.num_speculative_tokens
+        dev  = self.device
+        self._g_input_ids  = torch.zeros(Q, dtype=torch.int32, device=dev)
+        self._g_positions  = torch.zeros(Q, dtype=torch.int64, device=dev)
+        self._g_slots      = torch.zeros(Q, dtype=torch.int64, device=dev)
+        self._g_seq_lens   = torch.zeros(B, dtype=torch.int32, device=dev)
+        self._g_bonus      = torch.zeros(B, dtype=torch.int32, device=dev)
+        self._g_out        = torch.zeros(B, K, dtype=torch.int32, device=dev)
+        self._g_qsl        = torch.arange(B + 1, dtype=torch.int32, device=dev) * Q
+        self._g_qsl_cpu    = torch.arange(B + 1, dtype=torch.int32) * Q
+        self._sample_idx   = torch.tensor(
+            [i * Q + 1 + k for i in range(B) for k in range(K)],
+            dtype=torch.int64, device=dev)
+        # Padded to the whole pool so the width (and therefore the metadata) is
+        # the same at capture and at every replay.
+        self._g_block_table = torch.zeros(
+            B, max(1, self.num_blocks), dtype=torch.int32, device=dev)
+        self._g_cpu_ids    = torch.zeros(Q, dtype=torch.int32)
+        self._g_cpu_pos    = torch.zeros(Q, dtype=torch.int64)
+        self._g_cpu_slots  = torch.zeros(Q, dtype=torch.int64)
+        self._g_cpu_bonus  = torch.zeros(B, dtype=torch.int32)
+        self._g_cpu_bt     = torch.zeros(max(1, self.num_blocks), dtype=torch.int32)
+        # Context append, captured alongside the forward.  The rows past a
+        # request's committed prefix are real target hidden states for positions
+        # the query's own K/V write replaces before any attention reads them, and
+        # that the next append overwrites — the same ping-pong of committed and
+        # scratch rows the co-located speculator runs.  No row's value depends on
+        # the batch's valid length, so this shape can stay fixed.
+        H = self.draft_model_config.get_hidden_size()
+        self._a_hidden    = torch.zeros(Q, H, dtype=self.dtype, device=dev)
+        self._a_positions = torch.zeros(Q, dtype=torch.int64, device=dev)
+        self._a_slots     = torch.zeros(Q, dtype=torch.int64, device=dev)
+        self._a_cpu_pos   = torch.zeros(Q, dtype=torch.int64)
+        self._a_cpu_slots = torch.zeros(Q, dtype=torch.int64)
+        # When the drafter projects concatenated aux states, that projection can
+        # be captured too: it is one dense GEMM whose only input is the batch of
+        # raw aux rows, so the target's fc cost leaves the critical path with the
+        # rest of the step.
+        inner = getattr(self.model, "model", None)
+        fc    = getattr(inner, "fc", None)
+        if (getattr(inner, "use_aux_hidden_state", False)
+                and fc is not None and hasattr(fc, "in_features")):
+            self._a_raw = torch.zeros(Q, fc.in_features, dtype=self.dtype, device=dev)
+        else:
+            self._a_raw = None
+
+    def _stage_context_append(self, seq_id: str, pre_L: int) -> None:
+        """Stage one Q-row context append for the captured step.
+
+        `self._a_hidden` must already hold the target's whole batch of hidden
+        states; the rows the target rejected still get written, exactly as the
+        co-located speculator writes them.
+        """
+        B, Q   = self._graph_shape()
+        bs     = self.block_size
+        blocks = self.seq_block_tables.setdefault(seq_id, [])
+        for j in range(Q):
+            pos = pre_L + j
+            while pos >= len(blocks) * bs:
+                blocks.append(self.block_manager.allocate_one())
+            self._a_cpu_pos[j]   = pos
+            self._a_cpu_slots[j] = self._slot_for_position(blocks, pos)
+        self._a_positions.copy_(self._a_cpu_pos, non_blocking=True)
+        self._a_slots.copy_(self._a_cpu_slots, non_blocking=True)
+
+    def _graph_append(self) -> None:
+        states = self._a_hidden
+        if self._a_raw is not None:
+            states = self.model.combine_hidden_states(self._a_raw)
+        self.model.precompute_and_store_context_kv(
+            states, self._a_positions, self._a_slots)
+
+    def _plan_graph_step(self, seq_id: str, bonus_id: int,
+                         pre_L: int | None = None) -> tuple[dict, int]:
+        """Stage one draft step's inputs and rebuild the attention metadata.
+
+        Returns the per-layer metadata and the block count before the temporary
+        query blocks were allocated (they must outlive the graph replay).
+        """
+        from vllm.v1.attention.backend import CommonAttentionMetadata
+
+        B, Q   = self._graph_shape()
+        bs     = self.block_size
+        blocks = self.seq_block_tables.setdefault(seq_id, [])
+        L      = self.seq_lengths.get(seq_id, 0)
+        pre_blocks = len(blocks)
+
+        if pre_L is not None:
+            self._stage_context_append(seq_id, pre_L)
+
+        self._g_cpu_ids.fill_(self._get_mask_token_id())
+        self._g_cpu_ids[0] = bonus_id
+        for j in range(Q):
+            self._g_cpu_pos[j] = L + j
+        for j in range(Q):
+            pos = L + j
+            while pos >= len(blocks) * bs:
+                blocks.append(self.block_manager.allocate_one())
+            self._g_cpu_slots[j] = self._slot_for_position(blocks, pos)
+        self._g_cpu_bonus[0] = bonus_id
+        for i, blk in enumerate(blocks):
+            self._g_cpu_bt[i] = blk
+
+        self._g_input_ids.copy_(self._g_cpu_ids, non_blocking=True)
+        self._g_positions.copy_(self._g_cpu_pos, non_blocking=True)
+        self._g_slots.copy_(self._g_cpu_slots, non_blocking=True)
+        self._g_bonus.copy_(self._g_cpu_bonus, non_blocking=True)
+        self._g_block_table.zero_()
+        self._g_block_table[0, :len(blocks)].copy_(
+            self._g_cpu_bt[:len(blocks)], non_blocking=True)
+        self._g_seq_lens.fill_(L + Q)
+
+        cad = CommonAttentionMetadata(
+            query_start_loc       = self._g_qsl,
+            seq_lens              = self._g_seq_lens,
+            query_start_loc_cpu   = self._g_qsl_cpu,
+            seq_lens_cpu_upper_bound = L + Q,
+            num_reqs              = B,
+            num_actual_tokens     = Q,
+            max_query_len         = Q,
+            max_seq_len           = L + Q,
+            block_table_tensor    = self._g_block_table,
+            slot_mapping          = self._g_slots,
+            causal                = not self.requires_non_causal,
+        )
+
+        per_layer_meta: dict = {}
+        for group_list in self.attn_groups:
+            for group in group_list:
+                meta = group.get_metadata_builder().build_for_drafting(
+                    common_attn_metadata=cad, draft_index=0)
+                for ln in group.layer_names:
+                    per_layer_meta[ln] = meta
+        if not per_layer_meta:
+            raise RuntimeError("no attention metadata for the draft step")
+        _hook_ok = False
+        for meta in per_layer_meta.values():
+            wrapper = getattr(getattr(meta, "prefill", None), "wrapper", None)
+            if wrapper is not None and hasattr(wrapper, "_sm75_kv_indptr_gpu"):
+                _hook_ok = True
+                break
+        if not _hook_ok:
+            raise RuntimeError(
+                "draft step did not take the SM75 bypass path; the captured "
+                "kernels would replay against stale page metadata"
+            )
+        if pre_L is not None:
+            # The append wrote the same blocks the query slots live in, so none
+            # of them are scratch any more: every block allocated here holds
+            # committed context or the next append's scratch rows.
+            pre_blocks = len(blocks)
+        return per_layer_meta, pre_blocks
+
+    @torch.inference_mode()
+    def _capture_draft_graph(self) -> bool:
+        """Capture one draft step (B=1) into a CUDA graph."""
+        from vllm.forward_context import set_forward_context
+
+        B, Q = self._graph_shape()
+        K    = self.num_speculative_tokens
+        H    = self.draft_model_config.get_hidden_size()
+        seq_id = "__cudagraph__"
+
+        self._init_graph_buffers()
+        self.handle_prefill(
+            seq_id,
+            torch.zeros(self.block_size, H, dtype=self.dtype, device=self.device),
+        )
+        try:
+            side = torch.cuda.Stream(device=self.device)
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    plm, pre_blocks = self._plan_graph_step(seq_id, 0, pre_L=Q)
+                    with set_forward_context(plm, self.vllm_config, num_tokens=Q):
+                        self._graph_append()
+                        hidden = self.model(input_ids=self._g_input_ids,
+                                            positions=self._g_positions)
+                    self._select_draft_tokens(hidden, self._g_bonus, B, K,
+                                              out=self._g_out)
+                    self._free_query_blocks(seq_id, pre_blocks)
+            torch.cuda.current_stream(self.device).wait_stream(side)
+            torch.cuda.synchronize(self.device)
+
+            plm, pre_blocks = self._plan_graph_step(seq_id, 0, pre_L=Q)
+            self._cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._cuda_graph):
+                with set_forward_context(plm, self.vllm_config, num_tokens=Q):
+                    self._graph_append()
+                    hidden = self.model(input_ids=self._g_input_ids,
+                                        positions=self._g_positions)
+                self._select_draft_tokens(hidden, self._g_bonus, B, K,
+                                          out=self._g_out)
+            self._free_query_blocks(seq_id, pre_blocks)
+            torch.cuda.synchronize(self.device)
+            logger.info("Draft step CUDA graph captured (B=%d, Q=%d).", B, Q)
+            return True
+        except Exception as exc:
+            logger.warning("Draft CUDA graph capture failed, staying eager: %r",
+                           exc)
+            self._cuda_graph = None
+            return False
+        finally:
+            self.handle_free(seq_id)
+
+    @torch.inference_mode()
+    def _run_draft_forward_graph(self, seq_id: str, bonus_ids,
+                                 pre_L: int | None = None) -> torch.Tensor:
+        """Replay the captured step after refreshing its inputs."""
+        bonus_id = int(bonus_ids[0]) if torch.is_tensor(bonus_ids) else int(bonus_ids)
+        _plm, pre_blocks = self._plan_graph_step(seq_id, bonus_id, pre_L)
+        self._cuda_graph.replay()
+        self._free_query_blocks(seq_id, pre_blocks)
+        return self._g_out
 
 # ── ZMQ server loop ────────────────────────────────────────────────────────────
 
