@@ -751,7 +751,7 @@ class FIPrefill:
     sm75_page_size: int = 0
     sm75_num_reqs: int = 0
     sm75_query_len: int = 0
-    sm75_query_start_pos: int = 0  # absolute position of first query token
+    sm75_query_start_pos: torch.Tensor | None = None  # [B] GPU, first query pos
     # Causality of the calling layer's attention. Decoder self-attention is
     # causal; DFlash drafters are trained non-causal (config.is_causal=false)
     # and must read the whole query block bidirectionally.
@@ -1981,16 +1981,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_wrapper._sm75_kv_indptr_gpu = self.paged_kv_indptr.gpu[:num_prefills + 1]
                     prefill_wrapper._sm75_kv_indices_gpu = paged_kv_indices
                     prefill_wrapper._sm75_kv_last_len_gpu = self.paged_kv_last_page_len.gpu[:num_prefills]
+                    # Absolute position of each request's FIRST query token.
+                    # kv_lens is the exact KV length (it is rebuilt from
+                    # paged_kv_last_page_len, itself derived from the real
+                    # seq_lens), so the window starts query_len entries earlier.
+                    # Do NOT use seq_lens_cpu_upper_bound here: it is a
+                    # deliberately conservative bound and overshoots by the
+                    # previous step's rejected drafts in speculative decoding.
+                    # The kernel's causal limit is query_start_pos + offs_t,
+                    # i.e. self-inclusive.
+                    _qsp_values = (
+                        kv_lens_prefill_cpu
+                        - (
+                            qo_indptr_prefill_cpu[1:]
+                            - qo_indptr_prefill_cpu[:-1]
+                        )
+                    ).to(torch.int64)
+                    _qsp = getattr(prefill_wrapper, "_sm75_qsp_tensor", None)
+                    if _qsp is None or _qsp.shape[0] != _qsp_values.shape[0]:
+                        _qsp = _qsp_values.to(paged_kv_indices.device)
+                        prefill_wrapper._sm75_qsp_tensor = _qsp
+                    else:
+                        _qsp.copy_(_qsp_values.to(paged_kv_indices.device))
                     attn_metadata.prefill = FIPrefill(
                         wrapper=prefill_wrapper,
                         sm75_page_size=self.page_size,
                         sm75_num_reqs=num_prefills,
                         sm75_query_len=common_attn_metadata.max_query_len,
-                    sm75_query_start_pos=(
-                        common_attn_metadata.seq_lens_cpu_upper_bound
-                        - common_attn_metadata.max_query_len
-                        + 1
-                    ),
+                    sm75_query_start_pos=_qsp,
                     sm75_causal=(
                         bool(common_attn_metadata.causal)
                         if isinstance(common_attn_metadata.causal, bool)
@@ -2630,19 +2648,8 @@ class FlashInferImpl(AttentionImpl):
                                     layer, key, value, kv_cache,
                                     attn_metadata.slot_mapping[:num_actual_tokens],
                                 )
-                                # Stable GPU tensor for the causal limit so that
-                                # CUDA-graph replay reads the current T_bonus
-                                # from a fixed address (written by the caller).
-                                _qsp = getattr(
-                                    prefill_wrapper, '_sm75_qsp_tensor', None
-                                )
-                                if _qsp is None:
-                                    _qsp = torch.tensor(
-                                        [attn_metadata.prefill.sm75_query_start_pos],
-                                        dtype=torch.int64,
-                                        device=out_prefill.device,
-                                    )
-                                    prefill_wrapper._sm75_qsp_tensor = _qsp
+                                # Per-request start position, rebuilt from the
+                                # exact KV lengths when the metadata was built.
                                 sm75_paged_attn(
                                     prefill_query,
                                     kv_cache,
@@ -2654,7 +2661,9 @@ class FlashInferImpl(AttentionImpl):
                                     self.scale,
                                     out_prefill,
                                     causal=attn_metadata.prefill.sm75_causal,
-                                    query_start_pos=_qsp,
+                                    query_start_pos=(
+                                        attn_metadata.prefill.sm75_query_start_pos
+                                    ),
                                 )
                             else:
                                 sm75_paged_cross_attn(
