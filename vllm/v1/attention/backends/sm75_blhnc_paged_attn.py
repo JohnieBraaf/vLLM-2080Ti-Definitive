@@ -2,21 +2,21 @@
 """SM75 (Turing) Triton paged cross-attention for NHD KV cache layout.
 
 Raw kv_cache: NHD 4D [num_blocks, nkv, block_size, 2*head_dim].
-K = kv_cache[:, :, :, :head_dim], V = kv_cache[:, :, :, head_dim:].
 
-Design: one program per (query_token, query_head) — avoids tl.dot
-SMEM pressure by using tl.sum instead of tensor-core matmuls. Each
-instance holds HEAD_DIM-sized register vectors, well within SM75's
-64 KB SMEM limit. CUDA-graph-safe: all shapes are fixed; variable
-context is read from in-place-updated GPU tensors.
+Design: one program per (request, query_head), batch over QUERY_LEN tokens.
+HEAD_DIM=128 is split into two 64-wide chunks so each tl.dot tile fits within
+SM75's 64 KB SMEM limit. Uses FP16 tensor cores for compute.
 """
 
 import torch
 from vllm.triton_utils import tl, triton
 
+# Half of HEAD_DIM — must divide HEAD_DIM evenly.
+_CHUNK_D = 64
+
 
 @triton.jit
-def _nhd_paged_cross_attn_fwd(
+def _nhd_paged_attn_fwd(
     # Query:  [num_reqs * query_len, nq, hd]
     Q, q_stride_t, q_stride_h, q_stride_d,
     # Output: [num_reqs * query_len, nq, hd]
@@ -24,41 +24,51 @@ def _nhd_paged_cross_attn_fwd(
     # KV cache NHD 4D: [num_blocks, nkv, block_size, 2*hd]
     KV, kv_stride_b, kv_stride_h, kv_stride_l, kv_stride_c,
     # Paged-KV metadata — GPU tensors updated in-place each step
-    kv_indptr,       # [num_reqs + 1]  int32 GPU
-    kv_indices,      # [total_pages]   int32 GPU (full pre-allocated buffer)
-    kv_last_len,     # [num_reqs]      int32 GPU
+    kv_indptr,           # [num_reqs + 1]  int32 GPU
+    kv_indices,          # [total_pages]   int32 GPU (full pre-allocated buffer)
+    kv_last_len,         # [num_reqs]      int32 GPU
     # Scaling
     scale,
+    # Causal masking: pointer to a [num_reqs] int64 GPU tensor holding the
+    # absolute sequence position of the first query token for each request.
+    # Stored as a GPU tensor (not a scalar) so CUDA-graph replay works:
+    # the address is stable and the caller writes T_bonus before each replay.
+    # Pages are traversed in sequence order so slot (page_i, offs_l) has
+    # position page_i * BLOCK_SIZE + offs_l.  Only used when IS_CAUSAL.
+    query_start_pos_ptr,
     # Compile-time constants
-    QUERY_LEN: tl.constexpr,    # K+1, typically 8
+    QUERY_LEN:  tl.constexpr,   # K+1, typically 8
     BLOCK_SIZE: tl.constexpr,   # page_size, 16
-    HEAD_DIM: tl.constexpr,     # head_dim, 128
-    GQA_RATIO: tl.constexpr,    # nq // nkv
+    HEAD_DIM:   tl.constexpr,   # head_dim, 128
+    CHUNK_D:    tl.constexpr,   # HEAD_DIM // 2 = 64
+    GQA_RATIO:  tl.constexpr,   # nq // nkv
+    IS_CAUSAL:  tl.constexpr,   # True for self-attn, False for cross-attn
 ):
-    """One program per (query_token_index, query_head_index).
-
-    Uses tl.sum instead of tl.dot to avoid tl.dot's MMA SMEM tiles,
-    which exceed SM75's 64 KB shared-memory limit when HEAD_DIM=128.
-    """
-    tok_idx = tl.program_id(0)   # 0 .. num_reqs * QUERY_LEN - 1
-    q_head  = tl.program_id(1)   # 0 .. nq - 1
-
-    req_id  = tok_idx // QUERY_LEN
+    """Batch over QUERY_LEN; HEAD_DIM split into 2×CHUNK_D to fit 64 KB SMEM."""
+    req_id  = tl.program_id(0)
+    q_head  = tl.program_id(1)
     kv_head = q_head // GQA_RATIO
 
-    offs_d = tl.arange(0, HEAD_DIM)
+    q_base = req_id * QUERY_LEN
+    offs_t = tl.arange(0, QUERY_LEN)
     offs_l = tl.arange(0, BLOCK_SIZE)
+    offs_c = tl.arange(0, CHUNK_D)
 
-    # ── Load query vector: [HEAD_DIM] ─────────────────────────────────────────
-    q = tl.load(Q
-                + tok_idx * q_stride_t
-                + q_head  * q_stride_h
-                + offs_d  * q_stride_d).to(tl.float32)
+    # ── Load q in two halves: each [QUERY_LEN, CHUNK_D] ──────────────────────
+    q0 = tl.load(Q
+                 + (q_base + offs_t[:, None]) * q_stride_t
+                 + q_head * q_stride_h
+                 + offs_c[None, :] * q_stride_d).to(tl.float16)        # chunk 0
+    q1 = tl.load(Q
+                 + (q_base + offs_t[:, None]) * q_stride_t
+                 + q_head * q_stride_h
+                 + (CHUNK_D + offs_c[None, :]) * q_stride_d).to(tl.float16)  # chunk 1
 
-    # ── Online softmax state (scalars) ────────────────────────────────────────
-    m   = float("-inf")
-    l   = 0.0
-    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    # ── Online softmax accumulators ───────────────────────────────────────────
+    m    = tl.full((QUERY_LEN,), float("-inf"), dtype=tl.float32)
+    l    = tl.zeros((QUERY_LEN,), dtype=tl.float32)
+    acc0 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
+    acc1 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
 
     # ── Page range for this request ───────────────────────────────────────────
     page_start = tl.load(kv_indptr + req_id)
@@ -73,67 +83,140 @@ def _nhd_paged_cross_attn_fwd(
 
         kv_base = KV + block_idx * kv_stride_b + kv_head * kv_stride_h
 
-        # K: [BLOCK_SIZE, HEAD_DIM]
-        k = tl.load(kv_base
-                    + offs_l[:, None] * kv_stride_l
-                    + offs_d[None, :] * kv_stride_c,
-                    mask=offs_l[:, None] < valid,
-                    other=0.0).to(tl.float32)
+        # K chunk 0: [BLOCK_SIZE, CHUNK_D]
+        k0 = tl.load(kv_base
+                     + offs_l[:, None] * kv_stride_l
+                     + offs_c[None, :] * kv_stride_c,
+                     mask=offs_l[:, None] < valid,
+                     other=0.0).to(tl.float16)
+        # K chunk 1: [BLOCK_SIZE, CHUNK_D]
+        k1 = tl.load(kv_base
+                     + offs_l[:, None] * kv_stride_l
+                     + (CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                     mask=offs_l[:, None] < valid,
+                     other=0.0).to(tl.float16)
 
-        # V: [BLOCK_SIZE, HEAD_DIM]
-        v = tl.load(kv_base
-                    + offs_l[:, None] * kv_stride_l
-                    + (HEAD_DIM + offs_d[None, :]) * kv_stride_c,
-                    mask=offs_l[:, None] < valid,
-                    other=0.0).to(tl.float32)
+        # Scores: q0@k0.T + q1@k1.T → [QUERY_LEN, BLOCK_SIZE]
+        scores = (tl.dot(q0, tl.trans(k0), out_dtype=tl.float32)
+                + tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)) * scale
+        scores = tl.where(offs_l[None, :] < valid, scores, float("-inf"))
 
-        # Q·K^T via element-wise + sum — avoids tl.dot MMA SMEM tiles
-        # q: [HEAD_DIM], k: [BLOCK_SIZE, HEAD_DIM]
-        # scores[l] = sum_d(q[d] * k[l, d])
-        scores = tl.sum(q[None, :] * k, axis=1) * scale  # [BLOCK_SIZE]
-        scores = tl.where(offs_l < valid, scores, float("-inf"))
+        # Causal mask: query token at offset offs_t can only attend to KV
+        # slots at sequence positions <= query_start_pos + offs_t.
+        # Pages are traversed in order so position = page_i * BLOCK_SIZE + offs_l.
+        # query_start_pos is loaded from a stable GPU tensor so CUDA-graph
+        # replay works: the caller writes T_bonus before each replay.
+        if IS_CAUSAL:
+            query_start_pos  = tl.load(query_start_pos_ptr + req_id).to(tl.int64)
+            kv_seq_pos       = page_i * BLOCK_SIZE + offs_l          # [BLOCK_SIZE]
+            q_causal_limit   = query_start_pos + offs_t              # [QUERY_LEN]
+            scores = tl.where(
+                kv_seq_pos[None, :] > q_causal_limit[:, None],
+                float("-inf"), scores)
 
-        # Online softmax update
-        m_new = tl.max(tl.maximum(m, scores), axis=0)   # scalar
+        # Online softmax
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
         alpha = tl.exp(m - m_new)
-        exp_s = tl.exp(scores - m_new)                  # [BLOCK_SIZE]
+        exp_s = tl.exp(scores - m_new[:, None]).to(tl.float16)   # [QUERY_LEN, BLOCK_SIZE]
 
-        # acc += sum_l(exp_s[l] * v[l, :]) — element-wise, no tl.dot
-        acc = acc * alpha + tl.sum(exp_s[:, None] * v, axis=0)  # [HEAD_DIM]
-        l   = l   * alpha + tl.sum(exp_s,            axis=0)    # scalar
-        m   = m_new
+        # V chunk 0: [BLOCK_SIZE, CHUNK_D]
+        v0 = tl.load(kv_base
+                     + offs_l[:, None] * kv_stride_l
+                     + (HEAD_DIM + offs_c[None, :]) * kv_stride_c,
+                     mask=offs_l[:, None] < valid,
+                     other=0.0).to(tl.float16)
+        # V chunk 1: [BLOCK_SIZE, CHUNK_D]
+        v1 = tl.load(kv_base
+                     + offs_l[:, None] * kv_stride_l
+                     + (HEAD_DIM + CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                     mask=offs_l[:, None] < valid,
+                     other=0.0).to(tl.float16)
+
+        acc0 = acc0 * alpha[:, None] + tl.dot(exp_s, v0, out_dtype=tl.float32)
+        acc1 = acc1 * alpha[:, None] + tl.dot(exp_s, v1, out_dtype=tl.float32)
+        l    = l    * alpha          + tl.sum(exp_s.to(tl.float32), axis=1)
+        m    = m_new
 
     # ── Normalize and store ───────────────────────────────────────────────────
-    out = (acc / l).to(Out.dtype.element_ty)
+    inv_l = (1.0 / l).to(tl.float32)
+    out0 = (acc0 * inv_l[:, None]).to(Out.dtype.element_ty)
+    out1 = (acc1 * inv_l[:, None]).to(Out.dtype.element_ty)
+
     tl.store(Out
-             + tok_idx * o_stride_t
-             + q_head  * o_stride_h
-             + offs_d  * o_stride_d,
-             out)
+             + (q_base + offs_t[:, None]) * o_stride_t
+             + q_head * o_stride_h
+             + offs_c[None, :] * o_stride_d,
+             out0)
+    tl.store(Out
+             + (q_base + offs_t[:, None]) * o_stride_t
+             + q_head * o_stride_h
+             + (CHUNK_D + offs_c[None, :]) * o_stride_d,
+             out1)
 
 
-def _do_sm75_triton_warmup(
-    query_len: int, block_size: int, hd: int, nkv: int, nq: int
+def sm75_paged_attn(
+    query:           torch.Tensor,              # [B*Q, nq, hd]
+    kv_cache:        torch.Tensor,              # NHD 4D: [num_blocks, nkv, block_size, 2*hd]
+    kv_indptr:       torch.Tensor,              # [B+1]  int32 GPU
+    kv_indices:      torch.Tensor,              # [total_pages]  int32 GPU
+    kv_last_len:     torch.Tensor,              # [B]  int32 GPU
+    num_reqs:        int,
+    query_len:       int,
+    scale:           float,
+    output:          torch.Tensor,              # [B*Q, nq, hd]
+    causal:          bool         = False,
+    query_start_pos: torch.Tensor = None,       # [B] int64 GPU — T_bonus per request
 ) -> None:
-    """Pre-compile the SM75 Triton kernel before any CUDA graph capture.
+    """Triton paged attention for SM75/Turing, CUDA-graph-safe.
 
-    Call this from build() — which runs OUTSIDE the capture scope — so the
-    Triton JIT compilation completes before capture_begin().  The subsequent
-    call inside forward() (inside capture) then just launches the cached
-    pre-compiled kernel, which gets properly recorded in the CUDA graph.
+    Supports causal (self-attention) and non-causal (cross-attention) modes.
+    kv_cache must be NHD 4D: [num_blocks, nkv, block_size, 2*head_dim].
+
+    When causal=True, query_start_pos must be a [num_reqs] int64 GPU tensor
+    whose i-th element is the absolute sequence position of the first query
+    token for request i (T_bonus).  Storing T_bonus in a GPU tensor (rather
+    than passing it as a Python scalar) keeps the kernel-launch arguments
+    stable across steps so torch.cuda.CUDAGraph replay works correctly.
+    The caller writes the current T_bonus into the tensor before each replay.
+    Pages must be in sequence order (guaranteed by DraftModelRunner).
     """
-    try:
-        device = torch.cuda.current_device()
-        _q = torch.zeros(query_len, nq, hd, dtype=torch.float16, device=device)
-        _kv = torch.zeros(1, nkv, block_size, 2 * hd, dtype=torch.float16, device=device)
-        _iptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
-        _idx = torch.tensor([0], dtype=torch.int32, device=device)
-        _llen = torch.tensor([1], dtype=torch.int32, device=device)
-        _out = torch.zeros_like(_q)
-        sm75_paged_cross_attn(_q, _kv, _iptr, _idx, _llen, 1, query_len, 1.0, _out)
-        torch.cuda.synchronize()
-    except Exception:
-        pass  # Warmup failure is non-fatal; JIT will happen at inference time.
+    assert kv_cache.ndim == 4, (
+        f"Expected NHD 4D kv_cache, got ndim={kv_cache.ndim} shape={kv_cache.shape}"
+    )
+    nkv        = kv_cache.shape[1]
+    block_size = kv_cache.shape[2]
+    hd         = kv_cache.shape[3] // 2
+    nq         = query.shape[1]
+    gqa_ratio  = nq // nkv
+    chunk_d    = hd // 2
+
+    assert hd % 2 == 0, f"HEAD_DIM {hd} must be even for 2-chunk split"
+
+    if causal and query_start_pos is None:
+        raise ValueError("sm75_paged_attn: causal=True requires query_start_pos tensor")
+    if not causal:
+        if query_start_pos is None:
+            query_start_pos = torch.zeros(num_reqs, dtype=torch.int64,
+                                          device=query.device)
+
+    grid = (num_reqs, nq)
+
+    _nhd_paged_attn_fwd[grid](
+        query,    query.stride(0),    query.stride(1),    query.stride(2),
+        output,   output.stride(0),   output.stride(1),   output.stride(2),
+        kv_cache, kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
+        kv_indptr, kv_indices, kv_last_len,
+        scale,
+        query_start_pos,
+        QUERY_LEN=query_len,
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=hd,
+        CHUNK_D=chunk_d,
+        GQA_RATIO=gqa_ratio,
+        IS_CAUSAL=causal,
+        num_stages=1,
+        num_warps=4,
+    )
 
 
 def sm75_paged_cross_attn(
@@ -147,33 +230,14 @@ def sm75_paged_cross_attn(
     scale:       float,
     output:      torch.Tensor,   # [B*Q, nq, hd]
 ) -> None:
-    """Triton paged cross-attention, CUDA-graph-safe.
-
-    kv_cache must be NHD 4D: [num_blocks, nkv, block_size, 2*head_dim].
-    kv_indptr / kv_indices / kv_last_len are in-place-updated GPU tensors.
-    """
-    assert kv_cache.ndim == 4, (
-        f"Expected NHD 4D kv_cache, got ndim={kv_cache.ndim} shape={kv_cache.shape}"
+    """Non-causal alias kept for backward compatibility."""
+    sm75_paged_attn(
+        query, kv_cache, kv_indptr, kv_indices, kv_last_len,
+        num_reqs, query_len, scale, output,
+        causal=False,
     )
-    nkv        = kv_cache.shape[1]
-    block_size = kv_cache.shape[2]
-    hd         = kv_cache.shape[3] // 2
-    nq         = query.shape[1]
-    gqa_ratio  = nq // nkv
 
-    # One program per (query_token, query_head)
-    grid = (num_reqs * query_len, nq)
-
-    _nhd_paged_cross_attn_fwd[grid](
-        query,    query.stride(0),    query.stride(1),    query.stride(2),
-        output,   output.stride(0),   output.stride(1),   output.stride(2),
-        kv_cache, kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
-        kv_indptr, kv_indices, kv_last_len,
-        scale,
-        QUERY_LEN=query_len,
-        BLOCK_SIZE=block_size,
-        HEAD_DIM=hd,
-        GQA_RATIO=gqa_ratio,
-        num_stages=1,
-        num_warps=4,
-    )
+def _do_sm75_triton_warmup(ql,bs,hd,nkv,nq):
+    try:
+        import torch as _t;d=_t.cuda.current_device();_q=_t.zeros(ql,nq,hd,dtype=_t.float16,device=d);_kv=_t.zeros(1,nkv,bs,2*hd,dtype=_t.float16,device=d);_ip=_t.tensor([0,1],dtype=_t.int32,device=d);_ix=_t.tensor([0],dtype=_t.int32,device=d);_ll=_t.tensor([1],dtype=_t.int32,device=d);_out=_t.zeros_like(_q);sm75_paged_cross_attn(_q,_kv,_ip,_ix,_ll,1,ql,1.0,_out);_t.cuda.synchronize()
+    except Exception:pass
