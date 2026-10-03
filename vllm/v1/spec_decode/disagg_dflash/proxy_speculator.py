@@ -27,7 +27,6 @@ from vllm.v1.spec_decode.disagg_dflash.protocol import (
     build_decode,
     build_free,
     build_ping,
-    build_prefill,
     parse_draft_response,
     parse_header,
 )
@@ -56,6 +55,8 @@ class DisaggDFlashProposer(BaseSpeculator):
         assert vllm_config.speculative_config is not None
         spec = vllm_config.speculative_config
         self.num_speculative_steps = spec.num_speculative_tokens
+        self._dbg = bool(os.environ.get("VLLM_DISAGG_DEBUG"))
+        self._dbg_steps = 0
         self.draft_model_config    = spec.draft_model_config
         self.address               = spec.disagg_draft_address
 
@@ -197,7 +198,8 @@ class DisaggDFlashProposer(BaseSpeculator):
                 self._do_propose(input_batch, last_hidden_states,
                                  aux_hidden_states, num_reqs,
                                  temperature, seeds, last_sampled,
-                                 num_sampled, num_rejected)
+                                 num_sampled, num_rejected,
+                                 next_prefill_tokens)
             except Exception as exc:
                 # Log and continue — draft_tokens stay at zero.
                 # The broadcast below MUST still run so rank 1 doesn't deadlock.
@@ -226,8 +228,15 @@ class DisaggDFlashProposer(BaseSpeculator):
         last_sampled: torch.Tensor,   # [max_num_reqs] actual bonus token IDs
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
     ) -> None:
-        """Rank-0 only: contact the draft server and update self.draft_tokens."""
+        """Rank-0 only: contact the draft server and update self.draft_tokens.
+
+        Every step ships the whole scheduled batch — the same one the
+        co-located speculator gets in _prepare_dflash_inputs_kernel — and the
+        server appends only its accepted prefix to the drafter's context, so the
+        drafter's KV cache only ever holds committed tokens.
+        """
         req_ids = [input_batch.req_ids[i] for i in range(num_reqs)]
 
         # The drafter's KV cache is built from fc(concat(aux_hidden_states)) —
@@ -240,74 +249,67 @@ class DisaggDFlashProposer(BaseSpeculator):
             ctx_states = last_hidden_states
             use_aux = False
 
-        # ── detect finished sequences, send FREE ─────────────────────────────
         current  = set(req_ids)
         finished = self._active_seqs - current
         for seq_id in finished:
             self._send_free(seq_id)
+        self._active_seqs = current
 
-        # ── detect new (prefill) sequences, send PREFILL ──────────────────────
-        # Check against the OLD _active_seqs BEFORE updating it.
+        # Hidden states are laid out as one contiguous run per request, so the
+        # batch's token offsets are exactly query_start_loc.
         _qsl = getattr(input_batch, "query_start_loc_np", None)
         if _qsl is None:
             _qsl = getattr(input_batch, "query_start_loc", None)
-        qsl = _qsl
+        qsl_list = [int(_qsl[i]) for i in range(num_reqs + 1)]
+        total_T  = qsl_list[num_reqs]
 
-        new_in_this_call: set[int] = set()
-        for i, seq_id in enumerate(req_ids):
-            tok_start = int(qsl[i])
-            tok_end   = int(qsl[i + 1])
-            T_step    = tok_end - tok_start
-            # Send PREFILL for: (a) sequences we haven't seen before, OR
-            # (b) sequences still being prefilled in chunks (T_step > 1 means
-            #     this batch contains multiple tokens for this seq = prefill)
-            if seq_id not in self._active_seqs or T_step > 1:
-                new_in_this_call.add(i)
-                hs_seq  = ctx_states[tok_start:tok_end].cpu()
-                seq_len = int(input_batch.seq_lens_cpu_upper_bound[i])
-                pos     = torch.arange(seq_len - T_step, seq_len, dtype=torch.int64)
-                self._send_prefill(seq_id, hs_seq, pos, use_aux)
+        # The runner's hidden-state buffer is padded to the captured graph size;
+        # only the first total_T rows belong to this batch.
+        decode_hs = ctx_states[:total_T].cpu().to(torch.float16)
 
-        # Update tracking AFTER sending PREFILLs.
-        self._active_seqs = current
+        # Tokens the target rejected this step are not part of any request's
+        # context and must not enter the drafter's KV cache.
+        rejected = num_rejected[:num_reqs].cpu().to(torch.int32)
 
-        # ── build DECODE payload ──────────────────────────────────────────────
-        decode_hs    = torch.zeros(num_reqs, ctx_states.shape[-1], dtype=torch.float16)
-        decode_pos   = torch.zeros(num_reqs, dtype=torch.int64)
-        decode_temps = temperature[:num_reqs].cpu().float()
-        decode_seeds = seeds[:num_reqs].cpu()
+        # Bonus token: what the target just sampled, or the next prompt token
+        # when this step only extended the context (chunked prefill, no sample).
+        sampled = num_sampled[:num_reqs]
+        bonus_token_ids = torch.where(
+            sampled > 0,
+            last_sampled[:num_reqs].to(torch.int64),
+            next_prefill_tokens[:num_reqs].to(torch.int64),
+        ).cpu().to(torch.int32)
 
-        for i in range(num_reqs):
-            if i in new_in_this_call:
-                continue  # skip DECODE for newly-prefilled seqs — context not ready
-            tok_end = int(qsl[i + 1]) - 1
-            decode_hs[i]  = ctx_states[tok_end].cpu().to(torch.float16)
-            decode_pos[i] = int(input_batch.seq_lens_cpu_upper_bound[i]) - 1
-
-        if os.environ.get("VLLM_DISAGG_DEBUG"):
+        if self._dbg and self._dbg_steps < 40 and not str(req_ids[0]).startswith("_"):
+            self._dbg_steps += 1
             logger.warning(
-                "PROPOSE reqs=%s qsl=%s len_ub=%s sampled=%s rejected=%s "
-                "decode_pos=%s torch_len=%s aux=%s",
-                req_ids,
-                [int(qsl[i]) for i in range(num_reqs + 1)],
+                "PROPOSE reqs=%s qsl=%s len_ub=%s ncomp=%s pos=%s "
+                "sampled=%s rejected=%s "
+                "bonus=%s T=%d aux=%s hs_mean=%.3f hs_std=%.3f",
+                req_ids, qsl_list,
                 [int(input_batch.seq_lens_cpu_upper_bound[i])
                  for i in range(num_reqs)],
-                num_sampled[:num_reqs].cpu().tolist(),
-                num_rejected[:num_reqs].cpu().tolist(),
-                decode_pos.tolist(),
-                last_hidden_states.shape[0],
-                use_aux,
+                [int(input_batch.num_computed_tokens_np[i])
+                 for i in range(num_reqs)],
+                [int(v) for v in input_batch.positions[:total_T].cpu().tolist()]
+                if total_T <= 16 else
+                [int(v) for v in input_batch.positions[:8].cpu().tolist()],
+                sampled.cpu().tolist(), rejected.tolist(),
+                bonus_token_ids.tolist(), total_T, use_aux,
+                float(decode_hs.float().mean()), float(decode_hs.float().std()),
             )
 
-        # bonus_token_ids = the actual tokens just generated by the main model.
-        # These are used at j=0 (bonus position) in the DFlash2 forward pass so
-        # the model embeds the correct token rather than the mask token ID.
-        bonus_token_ids = last_sampled[:num_reqs].cpu().to(torch.int32)
-
         draft_tokens_cpu = self._send_decode(
-            req_ids, decode_hs, decode_pos, decode_temps, decode_seeds,
+            req_ids, decode_hs,
+            torch.tensor(qsl_list, dtype=torch.int32), rejected,
+            temperature[:num_reqs].cpu().float(), seeds[:num_reqs].cpu(),
             bonus_token_ids, use_aux,
         )
+        if self._dbg and self._dbg_steps <= 40:
+            logger.warning(
+                "PROXY row0 bonus=%s draft=%s",
+                int(bonus_token_ids[0]), draft_tokens_cpu[0].tolist(),
+            )
         self.draft_tokens[:num_reqs] = draft_tokens_cpu.to(
             device=self.device, dtype=torch.int64
         )
@@ -391,30 +393,20 @@ class DisaggDFlashProposer(BaseSpeculator):
             raise RuntimeError(f"Draft server ping failed: {hdr}")
         logger.info("Draft server ping OK.")
 
-    def _send_prefill(
-        self,
-        seq_id: str,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        aux: bool = False,
-    ) -> None:
-        hdr, _ = self._request(build_prefill, seq_id, hidden_states, positions, aux)
-        if hdr.get("t") != MSG_ACK:
-            raise RuntimeError(f"PREFILL failed for {seq_id}: {hdr}")
-
     def _send_decode(
         self,
         seq_ids: list[str],
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_rejected: torch.Tensor,
         temperatures: torch.Tensor,
         seeds: torch.Tensor,
         bonus_token_ids: torch.Tensor,
         aux: bool = False,
     ) -> torch.Tensor:
         hdr, resp_p = self._request(
-            build_decode, seq_ids, hidden_states, positions, temperatures, seeds,
-            bonus_token_ids, aux,
+            build_decode, seq_ids, hidden_states, query_start_loc, num_rejected,
+            temperatures, seeds, bonus_token_ids, aux,
         )
         if hdr.get("t") != MSG_ACK:
             raise RuntimeError(f"DECODE failed: {hdr}")
@@ -456,6 +448,7 @@ class DisaggDFlashProposer(BaseSpeculator):
                 "model": spec.draft_model_config.model,
                 "num_speculative_tokens": spec.num_speculative_tokens,
                 "kv_cache_dtype": str(spec.kv_cache_dtype) if spec.kv_cache_dtype else None,
+                "target_model": vllm_config.model_config.model,
             },
             "model_config": {
                 "max_model_len": vllm_config.model_config.max_model_len,

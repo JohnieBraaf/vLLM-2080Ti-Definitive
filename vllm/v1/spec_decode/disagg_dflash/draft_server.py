@@ -31,13 +31,11 @@ from vllm.v1.spec_decode.disagg_dflash.protocol import (
     MSG_DECODE,
     MSG_FREE,
     MSG_PING,
-    MSG_PREFILL,
     build_ack,
     build_draft_response,
     build_error,
     parse_decode_payload,
     parse_header,
-    parse_prefill_payload,
 )
 
 logger = init_logger(__name__)
@@ -87,6 +85,9 @@ class DraftModelRunner:
         self.device = device
         self.dist_master_port = dist_master_port
         self.kv_headroom_bytes = int(kv_headroom_gb * 1024 ** 3)
+        self._dbg = bool(os.environ.get("VLLM_DISAGG_DEBUG"))
+        self._dbg_steps = 0
+        self._dbg_real = False
         torch.cuda.set_device(device)
 
         self._build_vllm_config(vllm_config_dict)
@@ -97,8 +98,6 @@ class DraftModelRunner:
         self.seq_block_tables: dict[str, list[int]] = {}
         self.seq_lengths:      dict[str, int]       = {}
         self._cuda_graph = None
-        self._paged_kv_builders: list = []
-        self._cpu_block_idx_buf = None
 
         self._warmup_kernels()
 
@@ -117,6 +116,7 @@ class DraftModelRunner:
         self.num_speculative_tokens = spec["num_speculative_tokens"]
         self.kv_cache_dtype_str = spec.get("kv_cache_dtype") or "auto"
         self.max_model_len = d["model_config"]["max_model_len"]
+        self.target_model_path = spec.get("target_model")
         self.dtype_str = d["model_config"].get("dtype", "float16")
         self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[
             self.dtype_str
@@ -241,7 +241,72 @@ class DraftModelRunner:
             model_config=self.draft_model_config,
         )
         self.model.eval()
+        self._load_target_head_and_embed()
         logger.info("Draft model loaded.")
+
+    def _load_target_head_and_embed(self) -> None:
+        """Give the drafter the target's LM head and input embeddings.
+
+        The DFlash2 checkpoint ships neither (config.json has
+        tie_word_embeddings=false and the safetensors hold no lm_head or
+        embed_tokens): the drafter predicts in the target's hidden space, scores
+        its candidates with the target's LM head and embeds real token ids with
+        the target's vocabulary table.  The co-located path shares the live
+        target modules (load_dflash_model); a separate process has to load the
+        same tensors from the target checkpoint, otherwise every candidate logit
+        is zero and no draft can ever be accepted.
+        """
+        from safetensors import safe_open
+
+        if not self.target_model_path:
+            logger.warning(
+                "No target_model in the draft config: the drafter's lm_head and "
+                "embed_tokens stay unloaded and all candidate logits will be 0."
+            )
+            return
+        src = self.target_model_path
+        index = os.path.join(src, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index) as f:
+                weight_map = json.load(f)["weight_map"]
+        else:
+            with safe_open(os.path.join(src, "model.safetensors"), framework="pt") as f:
+                weight_map = {k: "model.safetensors" for k in f.keys()}
+
+        def _pick(suffix: str) -> str:
+            keys = sorted(k for k in weight_map if k.endswith(suffix))
+            if not keys:
+                raise RuntimeError(f"{src} has no '*{suffix}' weight")
+            return keys[0]
+
+        embed = None
+        for name, module in self.model.named_modules():
+            if name.endswith("embed_tokens"):
+                embed = module
+        if embed is None:
+            raise RuntimeError("drafter has no embed_tokens module")
+
+        for module, key in (
+            (self.model.lm_head, _pick("lm_head.weight")),
+            (embed, _pick("embed_tokens.weight")),
+        ):
+            with safe_open(os.path.join(src, weight_map[key]), framework="pt") as f:
+                tensor = f.get_tensor(key)
+            param = module.weight
+            if tuple(param.shape) != tuple(tensor.shape):
+                raise RuntimeError(
+                    f"{key}: target shape {tuple(tensor.shape)} does not match "
+                    f"the drafter's {tuple(param.shape)}"
+                )
+            with torch.no_grad():
+                param.copy_(tensor.to(device=self.device, dtype=param.dtype))
+            logger.info(
+                "Loaded target %s: %s %s mean=%.5f std=%.5f",
+                key, tuple(param.shape), param.dtype,
+                float(param.mean()), float(param.std()),
+            )
+            del tensor
+            torch.cuda.empty_cache()
 
     def _init_kv_cache(self) -> None:
         """Initialise KV cache using vLLM's proper infrastructure.
@@ -373,122 +438,126 @@ class DraftModelRunner:
             H        = self.draft_model_config.get_hidden_size()
             dummy_T  = self.block_size          # one full block of context
             dummy_hs = torch.zeros(dummy_T, H, dtype=self.dtype, device=self.device)
-            dummy_pos = torch.arange(dummy_T,  dtype=torch.int64, device=self.device)
             logger.info("Warmup: running handle_prefill (precompute_and_store_context_kv)…")
-            self.handle_prefill(seq_id, dummy_hs, dummy_pos)
+            self.handle_prefill(seq_id, dummy_hs)
             torch.cuda.synchronize(self.device)
             logger.info("Warmup: handle_prefill OK")
 
             dummy_new   = torch.zeros(1, H, dtype=self.dtype, device=self.device)
-            dummy_pos_n = torch.tensor([dummy_T], dtype=torch.int64, device=self.device)
+            dummy_qsl   = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
+            dummy_rej   = torch.zeros(1, dtype=torch.int32,   device=self.device)
             dummy_temps = torch.ones(1,  dtype=torch.float32, device=self.device)
             dummy_seeds = torch.zeros(1, dtype=torch.int64,   device=self.device)
             dummy_bonus = torch.zeros(1, dtype=torch.int32,   device=self.device)
             logger.info("Warmup: running handle_decode (model forward pass)…")
-            self.handle_decode([seq_id], dummy_new, dummy_pos_n, dummy_temps, dummy_seeds, dummy_bonus)
+            self.handle_decode([seq_id], dummy_new, dummy_qsl, dummy_rej,
+                               dummy_temps, dummy_seeds, dummy_bonus)
             torch.cuda.synchronize(self.device)
             logger.info("FlashInfer warmup complete.")
         except Exception as exc:
             logger.warning("Warmup failed (non-fatal): %s", exc)
         finally:
             self.handle_free(seq_id)
-        try:
-            self._init_persistent_metadata()
-        except Exception as _e:
-            logger.warning("Persistent metadata init failed: %s", _e)
-        self._cuda_graph = None  # graph disabled: always use eager path
 
     # ──────────────────────────────────────────────────────────────────────────
     # Request handlers
     # ──────────────────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
+    def _append_context(self, seq_id: str, hidden_states: torch.Tensor) -> None:
+        """Append committed tokens to a sequence's context at their true positions.
+
+        `seq_lengths` is the sequence's committed token count, which for a
+        coherent draft context is also the target's sequence length — the two
+        stay in lockstep because only the accepted prefix of each target batch is
+        ever appended here.
+        """
+        T = hidden_states.shape[0]
+        L = self.seq_lengths.get(seq_id, 0)
+        blocks = self.seq_block_tables.setdefault(seq_id, [])
+        needed = -(-(L + T) // self.block_size)
+        if needed > self.num_blocks:
+            raise RuntimeError(
+                f"APPEND seq={seq_id} L={L} T={T} needs {needed} blocks but only "
+                f"{self.num_blocks} available — dropping sequence"
+            )
+        while len(blocks) < needed:
+            blocks.append(self.block_manager.allocate_one())
+
+        positions = torch.arange(L, L + T, dtype=torch.int64, device=self.device)
+        slots = torch.tensor(
+            [self._slot_for_position(blocks, L + j) for j in range(T)],
+            dtype=torch.int64, device=self.device,
+        )
+        self.model.precompute_and_store_context_kv(hidden_states, positions, slots)
+        self.seq_lengths[seq_id] = L + T
+        if self._dbg:
+            logger.warning("APPEND seq=%s L=%d T=%d blocks=%d",
+                           seq_id, L, T, len(blocks))
+
+    @torch.inference_mode()
     def handle_prefill(
         self,
         seq_id: str,
         hidden_states: torch.Tensor,  # [T, H]
-        positions:     torch.Tensor,  # [T]
         use_aux:       bool = False,
     ) -> None:
-        T = hidden_states.shape[0]
-        logger.warning("PREFILL seq=%s T=%d pos0=%d posN=%d",
-                       seq_id, T, int(positions[0].item()), int(positions[-1].item()))
-        needed_blocks = -(-T // self.block_size)
-        if needed_blocks > self.num_blocks:
-            raise RuntimeError(
-                f"PREFILL T={T} needs {needed_blocks} blocks but only "
-                f"{self.num_blocks} available — dropping sequence"
-            )
+        """Out-of-band context load (kernel warmup only).
+
+        Real traffic always arrives as whole-batch DECODE messages.
+        """
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         if use_aux:
             hidden_states = self._combine_aux(hidden_states)
-        positions     = positions.to(device=self.device)
-
-        blocks       = self.block_manager.allocate(T)
-        if seq_id in self.seq_block_tables:
-            # Chunked prefill: extend existing context rather than overwriting.
-            # Each chunk writes its own new blocks; accumulate them.
-            self.seq_block_tables[seq_id].extend(blocks)
-            self.seq_lengths[seq_id] += T
-        else:
-            self.seq_block_tables[seq_id] = blocks
-            self.seq_lengths[seq_id]      = T
-
-        slot_mapping = self._compute_slot_mapping_for_sequence(blocks, T)
-
-        # precompute_and_store_context_kv is a direct KV write; no forward
-        # context required — it writes via FlashInfer's do_kv_cache_update using
-        # the slot_mapping, and the attention layers are already bound via
-        # bind_kv_cache_to_layers.
-        self.model.precompute_and_store_context_kv(
-            hidden_states,
-            positions,
-            slot_mapping,
-        )
-        logger.debug("PREFILL seq=%s T=%d blocks=%d", seq_id, T, len(blocks))
+        L = self.seq_lengths.get(seq_id, 0)
+        T = hidden_states.shape[0]
+        logger.warning("PREFILL seq=%s T=%d pos0=%d posN=%d", seq_id, T, L, L + T - 1)
+        self._append_context(seq_id, hidden_states)
 
     @torch.inference_mode()
     def handle_decode(
         self,
         seq_ids:       list[str],
-        hidden_states: torch.Tensor,  # [B, H]
-        positions:     torch.Tensor,  # [B]
+        hidden_states: torch.Tensor,  # [T_total, H]
+        query_start_loc: torch.Tensor,  # [B+1] int32 — offsets into T_total
+        num_rejected:  torch.Tensor,  # [B] int32 — trailing tokens the target rejected
         temperatures:  torch.Tensor,  # [B]
         seeds:         torch.Tensor,  # [B]
         bonus_ids:     torch.Tensor,  # [B] int32 — actual token IDs for j=0
         use_aux:       bool = False,
     ) -> torch.Tensor:                # [B, K]
-        B = len(seq_ids)
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
         if use_aux:
             hidden_states = self._combine_aux(hidden_states)
-        positions     = positions.to(device=self.device)
-        if os.environ.get("VLLM_DISAGG_DEBUG"):
+        qsl      = [int(v) for v in query_start_loc.tolist()]
+        rejected = [int(v) for v in num_rejected.tolist()]
+        B        = len(seq_ids)
+
+        if self._dbg and self._dbg_steps < 40 and not str(seq_ids[0]).startswith("_"):
+            self._dbg_steps += 1
+            self._dbg_real = True
             logger.warning(
-                "DECODE B=%d ctx=%s pos=%s bonus=%s aux=%s",
-                B,
-                [self.seq_lengths[s] for s in seq_ids],
-                positions.tolist(),
-                bonus_ids.tolist(),
-                use_aux,
+                "DECODE B=%d T=%d qsl=%s rejected=%s ctx=%s bonus=%s aux=%s",
+                B, qsl[-1], qsl, rejected,
+                [self.seq_lengths.get(s, 0) for s in seq_ids],
+                bonus_ids.tolist(), use_aux,
             )
 
-        # Extend each sequence with the newly generated token’s KV.
+        # A request's run holds [accepted prefix][rejected drafts]; only the
+        # prefix became real tokens for the target, so only it may enter the
+        # drafter's KV cache (the reference leaves rejected rows on PAD_SLOT_ID).
         for i, seq_id in enumerate(seq_ids):
-            T_old = self.seq_lengths[seq_id]
-            T_new = T_old + 1
-            blocks = self.seq_block_tables[seq_id]
-            if T_new > len(blocks) * self.block_size:
-                blocks.append(self.block_manager.allocate_one())
+            t0, t1  = qsl[i], qsl[i + 1]
+            n_valid = t1 - t0 - rejected[i]
+            if n_valid < 0:
+                logger.warning("DECODE: %s rejected=%d > T=%d, clamping",
+                               seq_id, rejected[i], t1 - t0)
+                n_valid = 0
+            if n_valid == 0:
+                continue
+            self._append_context(seq_id, hidden_states[t0:t0 + n_valid])
 
-            new_slot = self._slot_for_position(blocks, T_old)
-            hs_i     = hidden_states[i].unsqueeze(0)
-            pos_i    = positions[i].unsqueeze(0)
-            slot_i   = torch.tensor([new_slot], device=self.device, dtype=torch.int64)
-            self.model.precompute_and_store_context_kv(hs_i, pos_i, slot_i)
-            self.seq_lengths[seq_id] = T_new
-
-        return self._run_draft_forward(seq_ids, positions, bonus_ids)
+        return self._run_draft_forward(seq_ids, bonus_ids)
 
     def handle_free(self, seq_id: str) -> None:
         blocks = self.seq_block_tables.pop(seq_id, [])
@@ -503,13 +572,8 @@ class DraftModelRunner:
     def _run_draft_forward(
         self,
         seq_ids:   list[str],
-        positions: torch.Tensor,
         bonus_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if (getattr(self, "_cuda_graph", None) is not None
-                and len(seq_ids) == 1
-                and not torch.cuda.is_current_stream_capturing()):
-            return self._run_draft_forward_graph(seq_ids, positions, bonus_ids)
         from vllm.forward_context import set_forward_context
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -518,7 +582,8 @@ class DraftModelRunner:
         bs = self.block_size
 
         # ── sequence metadata ─────────────────────────────────────────────────
-        # After handle_decode, seq_lengths already include the new token.
+        # seq_lengths counts committed tokens, i.e. the context window is
+        # positions [0, L) — the same convention as a normal decode step.
         context_lens = torch.tensor(
             [self.seq_lengths[sid] for sid in seq_ids],
             dtype=torch.int32, device=self.device,
@@ -541,29 +606,26 @@ class DraftModelRunner:
         for _i in range(B):
             input_ids[_i * num_query_per_req] = int(_bids[_i].item())
 
-        # Positions: the bonus token is at context_lens[i] (the first slot after
-        # the last valid context position); query tokens at context_lens[i] + j
-        # for j in [0, num_query_per_req).  Matches the co-located reference
-        # (query_pos = last_valid_pos + 1 + query_off); the previous T_old start
-        # made the bonus slot collide with the context token's slot (~55% acc).
+        # Positions: the bonus token sits at the first free position L and the
+        # masks follow it, i.e. query_off = 0..K at absolute positions L+off.
+        # Matches the reference's query_pos = last_valid_pos + 1 + query_off.
         query_positions = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i in range(B):
-            base = int(positions[i].item())
+            base = int(context_lens[i].item())
             for j in range(num_query_per_req):
-                query_positions[i * num_query_per_req + j] = base + 1 + j
+                query_positions[i * num_query_per_req + j] = base + j
 
-        # Slot mapping for query tokens.
-        # The bonus slot (j=0) reuses position T_old = positions[i] — the same
-        # Allocate query slots. Save the pre-query block count per sequence so
-        # we can release the temporary query blocks after the forward pass.
+        # Allocate query slots in the same page table as the context (the next
+        # step's context append writes over them). Save the pre-query block count
+        # per sequence so the temporary query blocks can be released afterwards.
         pre_query_counts: list[int] = []
         query_slots = torch.zeros(num_query_total, dtype=torch.int64, device=self.device)
         for i, seq_id in enumerate(seq_ids):
-            blocks   = self.seq_block_tables[seq_id]
+            blocks = self.seq_block_tables[seq_id]
             pre_query_counts.append(len(blocks))   # save BEFORE extending
-            T_bonus  = int(positions[i].item())   # = T_old (bonus position)
+            base   = int(context_lens[i].item())
             for j in range(num_query_per_req):
-                pos = T_bonus + 1 + j             # T_old+1, T_old+2, …, T_old+K+1
+                pos = base + j
                 while pos >= len(blocks) * bs:
                     blocks.append(self.block_manager.allocate_one())
                 query_slots[i * num_query_per_req + j] = self._slot_for_position(blocks, pos)
@@ -678,9 +740,7 @@ class DraftModelRunner:
         hidden = hidden_all.view(-1, hidden_all.shape[-1])[sample_idx]
         hidden = hidden.view(B, K, -1)
 
-        candidate_ids, unary_logits = self.model.compute_candidates(
-            hidden.reshape(B * K, -1)
-        )
+        candidate_ids, unary_logits = self._candidates(hidden.reshape(B * K, -1))
         top_k = candidate_ids.shape[-1]
         candidate_ids = candidate_ids.view(B, K, top_k)
         unary_logits  = unary_logits.view(B, K, top_k)
@@ -697,21 +757,85 @@ class DraftModelRunner:
         draft_tokens = torch.zeros(B, K, dtype=torch.int32, device=self.device)
         rows = torch.arange(B, device=self.device)
         prev = torch.zeros(B, dtype=torch.int64, device=self.device)
+        if self._dbg and self._dbg_real:
+            logger.warning(
+                "DRAFT hidden mean=%.3f std=%.3f absmax=%.3f top1_ne=%d "
+                "cand0=%s unary0=%s anchor=%s",
+                float(hidden.mean()), float(hidden.std()),
+                float(hidden.abs().max()),
+                int((hidden.abs() < 1e-8).all(dim=-1).sum()),
+                candidate_ids[0, 0, :5].tolist(),
+                [round(float(v), 3) for v in unary_logits[0, 0, :5]],
+                bonus_ids.tolist(),
+            )
         for _l in range(K):
             idx = scores[:, _l, prev, :].argmax(dim=-1)
             draft_tokens[:, _l] = candidate_ids[rows, _l, idx].to(torch.int32)
             prev = idx
+        if self._dbg and self._dbg_real:
+            logger.warning("DRAFT out=%s", draft_tokens.tolist())
         return draft_tokens
+
+    def _candidates(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vocab top-k candidates for the DFlash2 selector.
+
+        Same as DFlash2Qwen3ForCausalLM.compute_candidates but the top-k runs in
+        torch rather than FlashInfer's radix kernel: on SM75 that kernel returns
+        bucket-strided indices with zeroed values, which poisons every draft.
+        """
+        lp = self.model.candidate_logits_processor
+        lm_head = self.model.lm_head
+        logits = lp._apply_head(lm_head, hidden_states, None)
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        k = self.model.model.candidate_selector.top_k
+        values, ids = torch.topk(logits.float(), k, dim=-1)
+        ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
+        if self._dbg and self._dbg_steps == 1:
+            fi_ids, fi_values = self.model.compute_candidates(hidden_states)
+            logger.warning(
+                "CAND tp=%d vstart=%d pad=%d logits=%s/%s mean=%.4f std=%.4f "
+                "max=%.4f argmax=%s",
+                lm_head.tp_size,
+                lm_head.shard_indices.org_vocab_start_index,
+                num_pad,
+                tuple(logits.shape),
+                logits.dtype,
+                float(logits.mean()),
+                float(logits.std()),
+                float(logits.max()),
+                logits.argmax(dim=-1)[: 3 * self.num_speculative_tokens].tolist(),
+            )
+            logger.warning(
+                "CAND torch ids=%s vals=%s",
+                ids[0, :5].tolist(),
+                [round(float(v), 3) for v in values[0, :5]],
+            )
+            logger.warning(
+                "CAND flashinfer ids=%s vals=%s",
+                fi_ids[0, :5].tolist(),
+                [round(float(v), 3) for v in fi_values[0, :5]],
+            )
+        if lm_head.tp_size > 1:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            values = tensor_model_parallel_all_gather(values, dim=-1)
+            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            values, selected = torch.topk(values, k, dim=-1)
+            ids = ids.gather(-1, selected)
+        values = values.float()
+        if lp.scale != 1.0:
+            values = values * lp.scale
+        if lp.soft_cap is not None:
+            values = torch.tanh(values / lp.soft_cap) * lp.soft_cap
+        return ids, values
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────────
-
-    def _compute_slot_mapping_for_sequence(
-        self, blocks: list[int], num_tokens: int
-    ) -> torch.Tensor:
-        slots = [self._slot_for_position(blocks, i) for i in range(num_tokens)]
-        return torch.tensor(slots, dtype=torch.int64, device=self.device)
 
     def _slot_for_position(self, blocks: list[int], pos: int) -> int:
         return blocks[pos // self.block_size] * self.block_size + pos % self.block_size
@@ -745,230 +869,6 @@ class DraftModelRunner:
     # via _update_paged_kv_direct() (~0.1 ms).  The SM75 wrapper attributes
     # (_sm75_kv_indptr_gpu, _sm75_kv_last_len_gpu) are VIEWS into these same
     # pre-allocated tensors, so they auto-reflect any in-place update.
-
-    @torch.inference_mode()
-    def _init_persistent_metadata(self) -> None:
-        from vllm.v1.attention.backend import CommonAttentionMetadata
-        B = 1
-        Q = 1 + self.num_speculative_tokens
-        H = self.draft_model_config.get_hidden_size()
-        bs = self.block_size
-        max_blocks = self.num_blocks + Q // bs + 4
-
-        # Pre-allocate CPU buffer for block indices (avoids per-step allocation)
-        self._cpu_block_idx_buf = torch.zeros(max_blocks, dtype=torch.int32)
-
-        # Dummy prefill to prime the builders with a valid block table
-        seq_id = "__pminit__"
-        self.handle_prefill(
-            seq_id,
-            torch.zeros(bs, H, dtype=self.dtype, device=self.device),
-            torch.arange(bs, dtype=torch.int64, device=self.device),
-        )
-        T_ctx   = self.seq_lengths[seq_id]
-        blocks  = self.seq_block_tables[seq_id]
-        n_blks  = len(blocks)
-        bt      = torch.zeros(B, n_blks, dtype=torch.int32, device=self.device)
-        bt[0, :n_blks] = torch.tensor(blocks[:n_blks], dtype=torch.int32,
-                                      device=self.device)
-        cad_sl  = torch.tensor([T_ctx + Q - 1], dtype=torch.int32, device=self.device)
-        cad = CommonAttentionMetadata(
-            query_start_loc=torch.tensor([0, Q], dtype=torch.int32, device=self.device),
-            seq_lens=cad_sl,
-            query_start_loc_cpu=torch.tensor([0, Q], dtype=torch.int32),
-            seq_lens_cpu_upper_bound=int(cad_sl[0].item()),
-            num_reqs=B, num_actual_tokens=Q,
-            max_query_len=Q, max_seq_len=int(cad_sl[0].item()),
-            block_table_tensor=bt,
-            slot_mapping=torch.zeros(Q, dtype=torch.int64, device=self.device),
-            causal=not self.requires_non_causal,
-        )
-        for _gl in self.attn_groups:
-            for _g in _gl:
-                try:
-                    _g.get_metadata_builder().build_for_drafting(
-                        common_attn_metadata=cad, draft_index=0)
-                    self._paged_kv_builders.append(_g.get_metadata_builder())
-                except Exception:
-                    pass
-        self.handle_free(seq_id)
-        logger.info("DraftGPUWorker: persistent metadata ready (%d builders).",
-                    len(self._paged_kv_builders))
-
-    def _update_paged_kv_direct(self, blocks: list, T_ctx: int) -> None:
-        """
-        Incremental paged_kv update — replaces build_for_drafting() each step.
-
-        For B=1 this is 3 tiny operations per builder:
-          1. paged_kv_indptr  [0, num_pages]  — H2D 2 int32s
-          2. paged_kv_indices [block_ids]     — H2D num_pages int32s
-          3. paged_kv_last_page_len [fill]    — H2D 1 int32
-        """
-        if not self._paged_kv_builders:
-            return
-        num_pages = len(blocks)
-        last_fill = T_ctx % self.block_size or self.block_size
-        # Fill CPU buffer (no allocation)
-        for _i in range(num_pages):
-            self._cpu_block_idx_buf[_i] = blocks[_i]
-        for builder in self._paged_kv_builders:
-            builder.paged_kv_indptr.np[0] = 0
-            builder.paged_kv_indptr.np[1] = num_pages
-            builder.paged_kv_indptr.gpu[0:2].copy_(
-                builder.paged_kv_indptr.cpu[0:2], non_blocking=True)
-            if num_pages > 0:
-                builder.paged_kv_indices[0:num_pages].copy_(
-                    self._cpu_block_idx_buf[0:num_pages].to(self.device),
-                    non_blocking=True)
-            builder.paged_kv_last_page_len.np[0] = last_fill
-            builder.paged_kv_last_page_len.gpu[0:1].copy_(
-                builder.paged_kv_last_page_len.cpu[0:1], non_blocking=True)
-
-    @torch.inference_mode()
-    def _try_capture_cuda_graph(self) -> None:
-        from vllm.forward_context import set_forward_context
-        from vllm.v1.attention.backend import CommonAttentionMetadata
-        B = 1
-        K = self.num_speculative_tokens
-        Q = 1 + K
-        H = self.draft_model_config.get_hidden_size()
-        bs = self.block_size
-        self._sg_input_ids       = torch.zeros(Q, dtype=torch.int32,  device=self.device)
-        self._sg_positions       = torch.zeros(Q, dtype=torch.int64,  device=self.device)
-        self._sg_slot_mapping    = torch.zeros(Q, dtype=torch.int64,  device=self.device)
-        self._sg_query_start_pos = torch.zeros(B, dtype=torch.int64,  device=self.device)
-        self._sg_Q = Q
-        self._sg_K = K
-        seq_id = "__cudagraph__"
-        self.handle_prefill(
-            seq_id,
-            torch.zeros(bs, H, dtype=self.dtype, device=self.device),
-            torch.arange(bs, dtype=torch.int64, device=self.device),
-        )
-
-        def _setup_step():
-            T_old  = self.seq_lengths[seq_id]
-            blocks = self.seq_block_tables[seq_id]
-            if T_old >= len(blocks) * bs:
-                blocks.append(self.block_manager.allocate_one())
-            slot_b = self._slot_for_position(blocks, T_old)
-            self.model.precompute_and_store_context_kv(
-                torch.zeros(1, H, dtype=self.dtype, device=self.device),
-                torch.tensor([T_old], dtype=torch.int64, device=self.device),
-                torch.tensor([slot_b], dtype=torch.int64, device=self.device),
-            )
-            self.seq_lengths[seq_id] = T_old + 1
-            T_ctx   = self.seq_lengths[seq_id]
-            T_bonus = T_old
-            self._sg_query_start_pos[0] = T_bonus + 1
-            self._sg_input_ids.fill_(self._get_mask_token_id())
-            self._sg_input_ids[0] = 0
-            for _j in range(Q):
-                self._sg_positions[_j] = T_bonus + 1 + _j
-            pre_cnt = len(blocks)
-            for _j in range(Q):
-                _pos = T_bonus + 1 + _j
-                while _pos >= len(blocks) * bs:
-                    blocks.append(self.block_manager.allocate_one())
-                self._sg_slot_mapping[_j] = self._slot_for_position(blocks, _pos)
-            # Incremental update (fast path)
-            self._update_paged_kv_direct(blocks[:pre_cnt], T_ctx)
-            # Build per_layer_meta with updated tensors
-            n_blks = len(blocks)
-            bt = torch.zeros(B, n_blks, dtype=torch.int32, device=self.device)
-            bt[0, :n_blks] = torch.tensor(
-                blocks[:n_blks], dtype=torch.int32, device=self.device)
-            cad_sl = torch.tensor([T_ctx + Q - 1], dtype=torch.int32, device=self.device)
-            cad = CommonAttentionMetadata(
-                query_start_loc=torch.tensor([0, Q], dtype=torch.int32, device=self.device),
-                seq_lens=cad_sl,
-                query_start_loc_cpu=torch.tensor([0, Q], dtype=torch.int32),
-                seq_lens_cpu_upper_bound=int(cad_sl[0].item()),
-                num_reqs=B, num_actual_tokens=Q,
-                max_query_len=Q, max_seq_len=int(cad_sl[0].item()),
-                block_table_tensor=bt,
-                slot_mapping=self._sg_slot_mapping,
-                causal=not self.requires_non_causal,
-            )
-            per_layer_meta = {}
-            for _gl in self.attn_groups:
-                for _g in _gl:
-                    try:
-                        _meta = _g.get_metadata_builder().build_for_drafting(
-                            common_attn_metadata=cad, draft_index=0)
-                        for _ln in _g.layer_names:
-                            per_layer_meta[_ln] = _meta
-                        if (_meta is not None
-                                and hasattr(_meta, 'prefill')
-                                and _meta.prefill is not None
-                                and hasattr(_meta.prefill, 'wrapper')
-                                and _meta.prefill.wrapper is not None
-                                and hasattr(_meta.prefill.wrapper, '_sm75_kv_indptr_gpu')):
-                            _meta.prefill.wrapper._sm75_qsp_tensor = self._sg_query_start_pos
-                    except Exception:
-                        pass
-            extra = blocks[pre_cnt:]
-            del blocks[pre_cnt:]
-            if extra:
-                self.block_manager.free(extra)
-            return per_layer_meta
-
-        try:
-            for _ in range(3):
-                _plm = _setup_step()
-                with set_forward_context(_plm, self.vllm_config, num_tokens=Q):
-                    self.model(input_ids=self._sg_input_ids, positions=self._sg_positions)
-                torch.cuda.synchronize(self.device)
-            _plm_cap = _setup_step()
-            self._cuda_graph = torch.cuda.CUDAGraph()
-            with set_forward_context(_plm_cap, self.vllm_config, num_tokens=Q):
-                with torch.cuda.graph(self._cuda_graph):
-                    self._sg_logits = self.model(
-                        input_ids=self._sg_input_ids,
-                        positions=self._sg_positions,
-                    )
-            torch.cuda.synchronize(self.device)
-            logger.info("DraftGPUWorker: CUDA graph captured (Q=%d).", Q)
-        finally:
-            self.handle_free(seq_id)
-
-    @torch.inference_mode()
-    def _run_draft_forward_graph(
-        self,
-        seq_ids:   list,
-        positions: torch.Tensor,
-        bonus_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        seq_id  = seq_ids[0]
-        Q       = self._sg_Q
-        K       = self._sg_K
-        bs      = self.block_size
-        T_bonus = int(positions[0].item())
-        blocks  = self.seq_block_tables[seq_id]
-        pre_cnt = len(blocks)
-        self._sg_input_ids.fill_(self._get_mask_token_id())
-        self._sg_input_ids[0] = int(bonus_ids[0].item())
-        for _j in range(Q):
-            self._sg_positions[_j] = T_bonus + 1 + _j
-        for _j in range(Q):
-            _pos = T_bonus + 1 + _j
-            while _pos >= len(blocks) * bs:
-                blocks.append(self.block_manager.allocate_one())
-            self._sg_slot_mapping[_j] = self._slot_for_position(blocks, _pos)
-        T_ctx = self.seq_lengths[seq_id]
-        self._sg_query_start_pos[0] = T_bonus + 1
-        # Incremental paged_kv update — the key DraftGPUWorker improvement
-        self._update_paged_kv_direct(blocks[:pre_cnt], T_ctx)
-        self._cuda_graph.replay()
-        draft_tokens = self._select_draft_tokens(
-            self._sg_logits, bonus_ids, 1, K
-        )
-        extra = blocks[pre_cnt:]
-        del blocks[pre_cnt:]
-        if extra:
-            self.block_manager.free(extra)
-        return draft_tokens
-
 
 # ── ZMQ server loop ────────────────────────────────────────────────────────────
 
@@ -1013,18 +913,12 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
             if t == MSG_PING:
                 resp_h, resp_p = build_ack(_seq)
 
-            elif t == MSG_PREFILL:
-                hs, pos = parse_prefill_payload(header, payload_frame)
-                runner.handle_prefill(
-                    header["seq_id"], hs, pos, bool(header.get("aux", False))
-                )
-                resp_h, resp_p = build_ack(_seq)
-
             elif t == MSG_DECODE:
-                hs, pos, temps, sds, bonus_ids = parse_decode_payload(header, payload_frame)
+                (hs, qsl, num_rejected, temps, sds,
+                 bonus_ids) = parse_decode_payload(header, payload_frame)
                 draft_tokens = runner.handle_decode(
-                    header["seq_ids"], hs, pos, temps, sds, bonus_ids,
-                    bool(header.get("aux", False)),
+                    header["seq_ids"], hs, qsl, num_rejected, temps, sds,
+                    bonus_ids, bool(header.get("aux", False)),
                 )
                 resp_h, resp_p = build_draft_response(draft_tokens, _seq)
 
@@ -1050,7 +944,24 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
     logger.info("Draft server stopped.")
 
 
+def _setup_logging() -> None:
+    """This process is spawned by the engine worker, which never configures the
+    root logger for it: without a handler every INFO message is dropped and
+    warnings fall through to logging.lastResort unformatted."""
+    import logging
+    import sys
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
 def main() -> None:
+    _setup_logging()
     parser = argparse.ArgumentParser(description="DFlash2 disaggregated draft server")
     parser.add_argument("--device", type=int, default=None,
         help="CUDA device ordinal to use. Sets CUDA_VISIBLE_DEVICES if not already "

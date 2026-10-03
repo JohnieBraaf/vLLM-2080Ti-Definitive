@@ -19,7 +19,6 @@ import torch
 
 # ── message types ──────────────────────────────────────────────────────────────
 MSG_PING    = 0  # health-check
-MSG_PREFILL = 1  # new sequence, store context KV
 MSG_DECODE  = 2  # batch decode step → draft tokens
 MSG_FREE    = 3  # sequence finished, release KV blocks
 MSG_ACK     = 4  # generic ok response
@@ -50,50 +49,32 @@ def build_ping(seq: int = 0) -> tuple[bytes, bytes]:
     return msgpack.packb({"t": MSG_PING, "seq": seq}), b""
 
 
-def build_prefill(
-    seq_id: str,
-    hidden_states: torch.Tensor,   # [T, H] float16
-    positions: torch.Tensor,        # [T] int64
-    aux: bool = False,              # hidden_states are concatenated aux states
-    seq: int = 0,
-) -> tuple[bytes, bytes]:
-    T, H = hidden_states.shape
-    header = {
-        "t":      MSG_PREFILL,
-        "seq_id": seq_id,
-        "T":      T,
-        "H":      H,
-        "aux":    bool(aux),
-        "seq":    seq,
-    }
-    # payload: hidden_states bytes || positions bytes
-    payload = pack_tensor(hidden_states.cpu().to(torch.float16)) + \
-              pack_tensor(positions.cpu().to(torch.int64))
-    return msgpack.packb(header), payload
-
-
 def build_decode(
     seq_ids: list[str],
-    hidden_states: torch.Tensor,   # [B, H] float16 — one new token per seq
-    positions: torch.Tensor,        # [B] int64
+    hidden_states: torch.Tensor,     # [T, H] float16 — the whole scheduled batch
+    query_start_loc: torch.Tensor,  # [B+1] int32 — per-seq token offsets into T
+    num_rejected: torch.Tensor,     # [B] int32 — trailing tokens rejected by the target
     temperatures: torch.Tensor,     # [B] float32
     seeds: torch.Tensor,            # [B] int64
     bonus_token_ids: torch.Tensor,  # [B] int32 — actual token IDs for bonus (j=0)
     aux: bool = False,              # hidden_states are concatenated aux states
     seq: int = 0,
 ) -> tuple[bytes, bytes]:
-    B, H = hidden_states.shape
+    B, H = len(seq_ids), hidden_states.shape[1]
+    T = hidden_states.shape[0]
     header = {
         "t":       MSG_DECODE,
         "seq_ids": seq_ids,
         "B":       B,
+        "T":       T,
         "H":       H,
         "aux":     bool(aux),
         "seq":     seq,
     }
     payload = (
         pack_tensor(hidden_states.cpu().to(torch.float16)) +
-        pack_tensor(positions.cpu().to(torch.int64)) +
+        pack_tensor(query_start_loc.cpu().to(torch.int32)) +
+        pack_tensor(num_rejected.cpu().to(torch.int32)) +
         pack_tensor(temperatures.cpu().to(torch.float32)) +
         pack_tensor(seeds.cpu().to(torch.int64)) +
         pack_tensor(bonus_token_ids.cpu().to(torch.int32))
@@ -135,31 +116,22 @@ def parse_draft_response(
     return unpack_tensor(payload, torch.int32, (B, K))
 
 
-def parse_prefill_payload(
-    header: dict, payload: bytes
-) -> tuple[torch.Tensor, torch.Tensor]:
-    T, H = header["T"], header["H"]
-    hs_bytes = T * H * 2          # float16
-    pos_bytes = T * 8              # int64
-    hidden_states = unpack_tensor(payload[:hs_bytes], torch.float16, (T, H))
-    positions     = unpack_tensor(payload[hs_bytes:hs_bytes + pos_bytes],
-                                  torch.int64, (T,))
-    return hidden_states, positions
-
-
 def parse_decode_payload(
     header: dict, payload: bytes
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    B, H = header["B"], header["H"]
-    hs_bytes    = B * H * 2   # float16
-    pos_bytes   = B * 8       # int64
-    temp_bytes  = B * 4       # float32
-    seed_bytes  = B * 8       # int64
-    bonus_bytes = B * 4       # int32
+) -> tuple[torch.Tensor, ...]:
+    B, H, T = header["B"], header["H"], header["T"]
+    hs_bytes    = T * H * 2        # float16
+    qsl_bytes   = (B + 1) * 4      # int32
+    rej_bytes   = B * 4            # int32
+    temp_bytes  = B * 4            # float32
+    seed_bytes  = B * 8            # int64
+    bonus_bytes = B * 4            # int32
     o = 0
-    hidden_states = unpack_tensor(payload[o:o+hs_bytes],   torch.float16, (B, H)); o += hs_bytes
-    positions     = unpack_tensor(payload[o:o+pos_bytes],  torch.int64,   (B,));   o += pos_bytes
-    temperatures  = unpack_tensor(payload[o:o+temp_bytes], torch.float32, (B,));   o += temp_bytes
-    seeds         = unpack_tensor(payload[o:o+seed_bytes], torch.int64,   (B,));   o += seed_bytes
-    bonus_ids     = unpack_tensor(payload[o:o+bonus_bytes],torch.int32,   (B,))
-    return hidden_states, positions, temperatures, seeds, bonus_ids
+    hidden_states   = unpack_tensor(payload[o:o+hs_bytes],    torch.float16, (T, H)); o += hs_bytes
+    query_start_loc = unpack_tensor(payload[o:o+qsl_bytes],   torch.int32,   (B + 1,)); o += qsl_bytes
+    num_rejected    = unpack_tensor(payload[o:o+rej_bytes],   torch.int32,   (B,)); o += rej_bytes
+    temperatures    = unpack_tensor(payload[o:o+temp_bytes],  torch.float32, (B,)); o += temp_bytes
+    seeds           = unpack_tensor(payload[o:o+seed_bytes],  torch.int64,   (B,)); o += seed_bytes
+    bonus_ids       = unpack_tensor(payload[o:o+bonus_bytes], torch.int32,   (B,))
+    return (hidden_states, query_start_loc, num_rejected, temperatures,
+            seeds, bonus_ids)
