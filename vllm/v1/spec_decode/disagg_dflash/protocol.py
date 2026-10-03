@@ -54,6 +54,7 @@ def build_prefill(
     seq_id: str,
     hidden_states: torch.Tensor,   # [T, H] float16
     positions: torch.Tensor,        # [T] int64
+    aux: bool = False,              # hidden_states are concatenated aux states
     seq: int = 0,
 ) -> tuple[bytes, bytes]:
     T, H = hidden_states.shape
@@ -62,6 +63,7 @@ def build_prefill(
         "seq_id": seq_id,
         "T":      T,
         "H":      H,
+        "aux":    bool(aux),
         "seq":    seq,
     }
     # payload: hidden_states bytes || positions bytes
@@ -77,6 +79,7 @@ def build_decode(
     temperatures: torch.Tensor,     # [B] float32
     seeds: torch.Tensor,            # [B] int64
     bonus_token_ids: torch.Tensor,  # [B] int32 — actual token IDs for bonus (j=0)
+    aux: bool = False,              # hidden_states are concatenated aux states
     seq: int = 0,
 ) -> tuple[bytes, bytes]:
     B, H = hidden_states.shape
@@ -85,6 +88,7 @@ def build_decode(
         "seq_ids": seq_ids,
         "B":       B,
         "H":       H,
+        "aux":     bool(aux),
         "seq":     seq,
     }
     payload = (

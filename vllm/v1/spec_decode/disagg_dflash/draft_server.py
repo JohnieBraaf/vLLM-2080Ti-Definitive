@@ -408,6 +408,7 @@ class DraftModelRunner:
         seq_id: str,
         hidden_states: torch.Tensor,  # [T, H]
         positions:     torch.Tensor,  # [T]
+        use_aux:       bool = False,
     ) -> None:
         T = hidden_states.shape[0]
         logger.warning("PREFILL seq=%s T=%d pos0=%d posN=%d",
@@ -419,6 +420,8 @@ class DraftModelRunner:
                 f"{self.num_blocks} available — dropping sequence"
             )
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
+        if use_aux:
+            hidden_states = self._combine_aux(hidden_states)
         positions     = positions.to(device=self.device)
 
         blocks       = self.block_manager.allocate(T)
@@ -453,10 +456,22 @@ class DraftModelRunner:
         temperatures:  torch.Tensor,  # [B]
         seeds:         torch.Tensor,  # [B]
         bonus_ids:     torch.Tensor,  # [B] int32 — actual token IDs for j=0
+        use_aux:       bool = False,
     ) -> torch.Tensor:                # [B, K]
         B = len(seq_ids)
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
+        if use_aux:
+            hidden_states = self._combine_aux(hidden_states)
         positions     = positions.to(device=self.device)
+        if os.environ.get("VLLM_DISAGG_DEBUG"):
+            logger.warning(
+                "DECODE B=%d ctx=%s pos=%s bonus=%s aux=%s",
+                B,
+                [self.seq_lengths[s] for s in seq_ids],
+                positions.tolist(),
+                bonus_ids.tolist(),
+                use_aux,
+            )
 
         # Extend each sequence with the newly generated token’s KV.
         for i, seq_id in enumerate(seq_ids):
@@ -565,7 +580,9 @@ class DraftModelRunner:
 
         # ── CommonAttentionMetadata ───────────────────────────────────────────
         # DFlash2 cross-attention: seq_lens = context + query (full KV window).
-        cad_seq_lens = context_lens + num_query_per_req - 1
+        # The query block spans num_query_per_req positions starting right after
+        # the context, so the window needs one entry per query slot too.
+        cad_seq_lens = context_lens + num_query_per_req
 
         cad = CommonAttentionMetadata(
             query_start_loc       = query_start_loc,
@@ -599,27 +616,19 @@ class DraftModelRunner:
             return torch.zeros(B, K, dtype=torch.int32, device=self.device)
 
         # ── model forward ─────────────────────────────────────────────────────
+        # The DFlash2 drafter returns hidden states; the draft tokens come from
+        # its candidate selector, not from an LM head argmax.
         with set_forward_context(
             per_layer_meta,
             self.vllm_config,
             num_tokens=num_query_total,
         ):
-            logits = self.model(
+            hidden_all = self.model(
                 input_ids=input_ids,
                 positions=query_positions,
             )
 
-        # logits: [num_query_total, vocab] or similar
-        # Sample from mask positions (skip the bonus slot at each group start).
-        sample_idx = torch.tensor(
-            [i * num_query_per_req + 1 + k for i in range(B) for k in range(K)],
-            dtype=torch.int64, device=self.device,
-        )
-        flat_logits = (
-            logits if logits.dim() == 2
-            else logits.view(-1, logits.shape[-1])
-        )
-        draft_tokens = flat_logits[sample_idx].argmax(dim=-1).int().view(B, K)
+        draft_tokens = self._select_draft_tokens(hidden_all, _bids, B, K)
 
         # Release the temporary query blocks — they are not part of the committed
         # sequence and must be freed each step or the block pool exhausts.
@@ -630,6 +639,68 @@ class DraftModelRunner:
             if _extra:
                 self.block_manager.free(_extra)
 
+        return draft_tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Draft token selection (DFlash2 candidate selector)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _combine_aux(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project concatenated target aux hidden states into drafter space.
+
+        The drafter's KV cache must be built from fc(concat(aux)) — the same
+        features the co-located speculator feeds to precompute_and_store_context_kv.
+        Feeding the target's plain last hidden state instead silently degrades
+        the drafts to noise.
+        """
+        return self.model.combine_hidden_states(hidden_states)
+
+    def _select_draft_tokens(
+        self,
+        hidden_all: torch.Tensor,   # [B * (1+K), H]
+        bonus_ids:  torch.Tensor,   # [B] bonus (anchor) token ids
+        B: int,
+        K: int,
+    ) -> torch.Tensor:              # [B, K] int32
+        """Pick draft tokens with DFlash2's candidate selector.
+
+        Mirrors the co-located DFlash2Speculator: take the top-k unary
+        candidates for each mask position, score the edges between consecutive
+        candidate slots with the learned codebooks, then walk the best edge.
+        A plain argmax over the drafter's LM head (or, worse, over its hidden
+        states) yields a different token and kills acceptance.
+        """
+        num_query_per_req = 1 + K
+        sample_idx = torch.tensor(
+            [i * num_query_per_req + 1 + k for i in range(B) for k in range(K)],
+            dtype=torch.int64, device=self.device,
+        )
+        hidden = hidden_all.view(-1, hidden_all.shape[-1])[sample_idx]
+        hidden = hidden.view(B, K, -1)
+
+        candidate_ids, unary_logits = self.model.compute_candidates(
+            hidden.reshape(B * K, -1)
+        )
+        top_k = candidate_ids.shape[-1]
+        candidate_ids = candidate_ids.view(B, K, top_k)
+        unary_logits  = unary_logits.view(B, K, top_k)
+
+        scores = self.model.model.candidate_selector(
+            candidate_ids,
+            unary_logits,
+            hidden,
+            bonus_ids.to(device=self.device, dtype=torch.int64),
+        )
+
+        # Greedy walk: step l ranks successors given the candidate picked at
+        # step l-1 (the anchor token at l=0).
+        draft_tokens = torch.zeros(B, K, dtype=torch.int32, device=self.device)
+        rows = torch.arange(B, device=self.device)
+        prev = torch.zeros(B, dtype=torch.int64, device=self.device)
+        for _l in range(K):
+            idx = scores[:, _l, prev, :].argmax(dim=-1)
+            draft_tokens[:, _l] = candidate_ids[rows, _l, idx].to(torch.int32)
+            prev = idx
         return draft_tokens
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -889,9 +960,9 @@ class DraftModelRunner:
         # Incremental paged_kv update — the key DraftGPUWorker improvement
         self._update_paged_kv_direct(blocks[:pre_cnt], T_ctx)
         self._cuda_graph.replay()
-        flat = (self._sg_logits if self._sg_logits.dim() == 2
-                else self._sg_logits.view(-1, self._sg_logits.shape[-1]))
-        draft_tokens = flat[1:Q].argmax(dim=-1).int().view(1, K)
+        draft_tokens = self._select_draft_tokens(
+            self._sg_logits, bonus_ids, 1, K
+        )
         extra = blocks[pre_cnt:]
         del blocks[pre_cnt:]
         if extra:
@@ -944,13 +1015,16 @@ def run_server(runner: DraftModelRunner, address: str) -> None:
 
             elif t == MSG_PREFILL:
                 hs, pos = parse_prefill_payload(header, payload_frame)
-                runner.handle_prefill(header["seq_id"], hs, pos)
+                runner.handle_prefill(
+                    header["seq_id"], hs, pos, bool(header.get("aux", False))
+                )
                 resp_h, resp_p = build_ack(_seq)
 
             elif t == MSG_DECODE:
                 hs, pos, temps, sds, bonus_ids = parse_decode_payload(header, payload_frame)
                 draft_tokens = runner.handle_decode(
-                    header["seq_ids"], hs, pos, temps, sds, bonus_ids
+                    header["seq_ids"], hs, pos, temps, sds, bonus_ids,
+                    bool(header.get("aux", False)),
                 )
                 resp_h, resp_p = build_draft_response(draft_tokens, _seq)
 
