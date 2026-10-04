@@ -4,8 +4,9 @@
 Raw kv_cache: NHD 4D [num_blocks, nkv, block_size, 2*head_dim].
 
 Design: one program per (request, query_head), batch over QUERY_LEN tokens.
-HEAD_DIM=128 is split into two 64-wide chunks so each tl.dot tile fits within
-SM75's 64 KB SMEM limit. Uses FP16 tensor cores for compute.
+HEAD_DIM is split into 64-wide chunks (NUM_CHUNKS = HEAD_DIM // 64) so each
+tl.dot tile fits within SM75's 64 KB SMEM limit. Supports hd=128 (2 chunks)
+and hd=256 (4 chunks). Uses FP16 tensor cores for compute.
 """
 
 import torch
@@ -37,38 +38,60 @@ def _nhd_paged_attn_fwd(
     # position page_i * BLOCK_SIZE + offs_l.  Only used when IS_CAUSAL.
     query_start_pos_ptr,
     # Compile-time constants
-    QUERY_LEN:  tl.constexpr,   # K+1, typically 8
+    QUERY_LEN:  tl.constexpr,   # real query length, K+1
+    QUERY_PAD:  tl.constexpr,   # next_power_of_2(QUERY_LEN): tl.arange needs pow2
     BLOCK_SIZE: tl.constexpr,   # page_size, 16
     HEAD_DIM:   tl.constexpr,   # head_dim, 128
-    CHUNK_D:    tl.constexpr,   # HEAD_DIM // 2 = 64
+    CHUNK_D:    tl.constexpr,   # always 64: fits within SM75 64 KB SMEM
+    NUM_CHUNKS: tl.constexpr,   # HEAD_DIM // 64 — 2 for hd=128, 4 for hd=256
     GQA_RATIO:  tl.constexpr,   # nq // nkv
     IS_CAUSAL:  tl.constexpr,   # True for self-attn, False for cross-attn
 ):
-    """Batch over QUERY_LEN; HEAD_DIM split into 2×CHUNK_D to fit 64 KB SMEM."""
+    """Batch over QUERY_LEN; HEAD_DIM split into NUM_CHUNKS×64 chunks to fit SM75 64 KB SMEM."""
     req_id  = tl.program_id(0)
     q_head  = tl.program_id(1)
     kv_head = q_head // GQA_RATIO
 
     q_base = req_id * QUERY_LEN
-    offs_t = tl.arange(0, QUERY_LEN)
+    # Triton requires arange bounds to be a power of two, but the query length
+    # is K+1: 8 for DFlash2 K=7, 3 or 5 for MTP.  Pad the row dimension and mask
+    # the padding rows on both the q load and the store.
+    offs_t  = tl.arange(0, QUERY_PAD)
+    t_valid = offs_t < QUERY_LEN
     offs_l = tl.arange(0, BLOCK_SIZE)
     offs_c = tl.arange(0, CHUNK_D)
 
-    # ── Load q in two halves: each [QUERY_LEN, CHUNK_D] ──────────────────────
+    # ── Load q in NUM_CHUNKS halves: each [QUERY_LEN, CHUNK_D] ─────────────────
     q0 = tl.load(Q
                  + (q_base + offs_t[:, None]) * q_stride_t
                  + q_head * q_stride_h
-                 + offs_c[None, :] * q_stride_d).to(tl.float16)        # chunk 0
+                 + offs_c[None, :] * q_stride_d,
+                 mask=t_valid[:, None], other=0.0).to(tl.float16)      # chunk 0
     q1 = tl.load(Q
                  + (q_base + offs_t[:, None]) * q_stride_t
                  + q_head * q_stride_h
-                 + (CHUNK_D + offs_c[None, :]) * q_stride_d).to(tl.float16)  # chunk 1
+                 + (CHUNK_D + offs_c[None, :]) * q_stride_d,
+                 mask=t_valid[:, None], other=0.0).to(tl.float16)      # chunk 1
+    if NUM_CHUNKS >= 4:
+        q2 = tl.load(Q
+                     + (q_base + offs_t[:, None]) * q_stride_t
+                     + q_head * q_stride_h
+                     + (2 * CHUNK_D + offs_c[None, :]) * q_stride_d,
+                     mask=t_valid[:, None], other=0.0).to(tl.float16)  # chunk 2
+        q3 = tl.load(Q
+                     + (q_base + offs_t[:, None]) * q_stride_t
+                     + q_head * q_stride_h
+                     + (3 * CHUNK_D + offs_c[None, :]) * q_stride_d,
+                     mask=t_valid[:, None], other=0.0).to(tl.float16)  # chunk 3
 
     # ── Online softmax accumulators ───────────────────────────────────────────
-    m    = tl.full((QUERY_LEN,), float("-inf"), dtype=tl.float32)
-    l    = tl.zeros((QUERY_LEN,), dtype=tl.float32)
-    acc0 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
-    acc1 = tl.zeros((QUERY_LEN, CHUNK_D), dtype=tl.float32)
+    m    = tl.full((QUERY_PAD,), float("-inf"), dtype=tl.float32)
+    l    = tl.zeros((QUERY_PAD,), dtype=tl.float32)
+    acc0 = tl.zeros((QUERY_PAD, CHUNK_D), dtype=tl.float32)
+    acc1 = tl.zeros((QUERY_PAD, CHUNK_D), dtype=tl.float32)
+    if NUM_CHUNKS >= 4:
+        acc2 = tl.zeros((QUERY_PAD, CHUNK_D), dtype=tl.float32)
+        acc3 = tl.zeros((QUERY_PAD, CHUNK_D), dtype=tl.float32)
 
     # ── Page range for this request ───────────────────────────────────────────
     page_start = tl.load(kv_indptr + req_id)
@@ -95,10 +118,23 @@ def _nhd_paged_attn_fwd(
                      + (CHUNK_D + offs_c[None, :]) * kv_stride_c,
                      mask=offs_l[:, None] < valid,
                      other=0.0).to(tl.float16)
+        if NUM_CHUNKS >= 4:
+            k2 = tl.load(kv_base
+                         + offs_l[:, None] * kv_stride_l
+                         + (2 * CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                         mask=offs_l[:, None] < valid,
+                         other=0.0).to(tl.float16)
+            k3 = tl.load(kv_base
+                         + offs_l[:, None] * kv_stride_l
+                         + (3 * CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                         mask=offs_l[:, None] < valid,
+                         other=0.0).to(tl.float16)
 
-        # Scores: q0@k0.T + q1@k1.T → [QUERY_LEN, BLOCK_SIZE]
-        scores = (tl.dot(q0, tl.trans(k0), out_dtype=tl.float32)
-                + tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)) * scale
+        # Scores: sum_c(qc @ kc.T) → [QUERY_LEN, BLOCK_SIZE]
+        scores = tl.dot(q0, tl.trans(k0), out_dtype=tl.float32) + tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)
+        if NUM_CHUNKS >= 4:
+            scores = scores + tl.dot(q2, tl.trans(k2), out_dtype=tl.float32) + tl.dot(q3, tl.trans(k3), out_dtype=tl.float32)
+        scores = scores * scale
         scores = tl.where(offs_l[None, :] < valid, scores, float("-inf"))
 
         # Causal mask: query token at offset offs_t can only attend to KV
@@ -131,9 +167,23 @@ def _nhd_paged_attn_fwd(
                      + (HEAD_DIM + CHUNK_D + offs_c[None, :]) * kv_stride_c,
                      mask=offs_l[:, None] < valid,
                      other=0.0).to(tl.float16)
+        if NUM_CHUNKS >= 4:
+            v2 = tl.load(kv_base
+                         + offs_l[:, None] * kv_stride_l
+                         + (HEAD_DIM + 2 * CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                         mask=offs_l[:, None] < valid,
+                         other=0.0).to(tl.float16)
+            v3 = tl.load(kv_base
+                         + offs_l[:, None] * kv_stride_l
+                         + (HEAD_DIM + 3 * CHUNK_D + offs_c[None, :]) * kv_stride_c,
+                         mask=offs_l[:, None] < valid,
+                         other=0.0).to(tl.float16)
 
         acc0 = acc0 * alpha[:, None] + tl.dot(exp_s, v0, out_dtype=tl.float32)
         acc1 = acc1 * alpha[:, None] + tl.dot(exp_s, v1, out_dtype=tl.float32)
+        if NUM_CHUNKS >= 4:
+            acc2 = acc2 * alpha[:, None] + tl.dot(exp_s, v2, out_dtype=tl.float32)
+            acc3 = acc3 * alpha[:, None] + tl.dot(exp_s, v3, out_dtype=tl.float32)
         l    = l    * alpha          + tl.sum(exp_s.to(tl.float32), axis=1)
         m    = m_new
 
@@ -141,17 +191,31 @@ def _nhd_paged_attn_fwd(
     inv_l = (1.0 / l).to(tl.float32)
     out0 = (acc0 * inv_l[:, None]).to(Out.dtype.element_ty)
     out1 = (acc1 * inv_l[:, None]).to(Out.dtype.element_ty)
+    if NUM_CHUNKS >= 4:
+        out2 = (acc2 * inv_l[:, None]).to(Out.dtype.element_ty)
+        out3 = (acc3 * inv_l[:, None]).to(Out.dtype.element_ty)
 
     tl.store(Out
              + (q_base + offs_t[:, None]) * o_stride_t
              + q_head * o_stride_h
              + offs_c[None, :] * o_stride_d,
-             out0)
+             out0, mask=t_valid[:, None])
     tl.store(Out
              + (q_base + offs_t[:, None]) * o_stride_t
              + q_head * o_stride_h
              + (CHUNK_D + offs_c[None, :]) * o_stride_d,
-             out1)
+             out1, mask=t_valid[:, None])
+    if NUM_CHUNKS >= 4:
+        tl.store(Out
+                 + (q_base + offs_t[:, None]) * o_stride_t
+                 + q_head * o_stride_h
+                 + (2 * CHUNK_D + offs_c[None, :]) * o_stride_d,
+                 out2, mask=t_valid[:, None])
+        tl.store(Out
+                 + (q_base + offs_t[:, None]) * o_stride_t
+                 + q_head * o_stride_h
+                 + (3 * CHUNK_D + offs_c[None, :]) * o_stride_d,
+                 out3, mask=t_valid[:, None])
 
 
 def sm75_paged_attn(
@@ -188,9 +252,10 @@ def sm75_paged_attn(
     hd         = kv_cache.shape[3] // 2
     nq         = query.shape[1]
     gqa_ratio  = nq // nkv
-    chunk_d    = hd // 2
+    chunk_d    = 64
+    num_chunks = hd // 64
 
-    assert hd % 2 == 0, f"HEAD_DIM {hd} must be even for 2-chunk split"
+    assert hd % 64 == 0, f"HEAD_DIM {hd} must be a multiple of 64"
 
     if causal and query_start_pos is None:
         raise ValueError("sm75_paged_attn: causal=True requires query_start_pos tensor")
@@ -209,9 +274,11 @@ def sm75_paged_attn(
         scale,
         query_start_pos,
         QUERY_LEN=query_len,
+        QUERY_PAD=1 << (query_len - 1).bit_length(),
         BLOCK_SIZE=block_size,
         HEAD_DIM=hd,
         CHUNK_D=chunk_d,
+        NUM_CHUNKS=num_chunks,
         GQA_RATIO=gqa_ratio,
         IS_CAUSAL=causal,
         num_stages=1,
